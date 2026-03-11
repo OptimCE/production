@@ -42,9 +42,7 @@ services:
     # Then use the `image` directive instead of `build`.
     image: ghcr.io/optimce/kc-groupid-mapper:main
     restart: unless-stopped
-    command: ["start", "--import-realm", "--verbose" ]
-    ports:
-      - "8080:8080"
+    command: ["start", "--import-realm", "--verbose", "--proxy-headers=xforwarded"]
     environment:
       - KC_BOOTSTRAP_ADMIN_USERNAME=${KEYCLOAK_ADMIN:-admin}
       - KC_BOOTSTRAP_ADMIN_PASSWORD=${KEYCLOAK_ADMIN_PASSWORD}
@@ -114,14 +112,14 @@ services:
     image: alpine/curl:latest
     command: ["-fL", "https://optimce.github.io/crm-backend/swagger.yml", "-o", "/data/swagger.yaml"]
     volumes:
-      - krakend_config:/data:z
+      - ./krakend_config:/data:z
     restart: on-failure
 
   krakend-config:
     profiles: ["init"]
     image: ghcr.io/optimce/swagger2krakend:main
     volumes:
-      - krakend_config:/etc/krakend
+      - ./krakend_config:/etc/krakend
     environment:
       - SWAGGER_FILE=/etc/krakend/swagger.yaml
       - OUTPUT_FILE=/etc/krakend/krakend.json
@@ -137,10 +135,8 @@ services:
   krakend:
     profiles: ["backend"]
     image: krakend:latest
-    ports:
-      - "8090:8080"
     volumes:
-      - krakend_config:/etc/krakend
+      - ./krakend_config:/etc/krakend
     networks:
       - api-gateway
       - reverse-proxy
@@ -218,14 +214,13 @@ services:
     volumes:
       - ./crm-frontend-config:/config
     command: 
-    - "< /config/config.template.json > /config/config.json"
+    - < /config/config.template.json > /config/config.json
 
   crm-frontend:
     profiles: ["frontend"]
     image: ghcr.io/optimce/crm-frontend:main
     volumes:
-      - ./crm-frontend-config/config.json:/usr/share/nginx/html/assets/config.json
-      # - ./nginx/conf.d/default.conf:/etc/nginx/conf.d/default.conf
+      - ./crm-frontend-config/config.json:/usr/share/nginx/html/assets/config/config.json
     networks:
       - reverse-proxy
 
