@@ -123,7 +123,7 @@ services:
     environment:
       - SWAGGER_FILE=/etc/krakend/swagger.yaml
       - OUTPUT_FILE=/etc/krakend/krakend.json
-      - KEYCLOAK_URL=http://keycloak:8080
+      - KEYCLOAK_URL=http://keycloak:8080/keycloak
       - REALM_NAME=optimce-realm
       - BACKEND_HOST=http://crm-backend:80
       - ISSUER=http://localhost/keycloak/realms/optimce-realm
@@ -165,7 +165,6 @@ services:
     restart: unless-stopped
     environment:
       - NODE_ENV=production
-      - PORT=80
       - MICROSERVICE_NAME=crm-backend
       - ALLOWED_ORIGIN=${ALLOWED_ORIGIN:-http://localhost}
       - SERVER_HOST=0.0.0.0
@@ -223,9 +222,6 @@ services:
       - ./crm-frontend-config/config.json:/usr/share/nginx/html/assets/config/config.json
     networks:
       - reverse-proxy
-    # depends_on:
-    #   crm-frontend-config:
-    #     condition: service_completed_successfully
 
 volumes:
   crm_db_data:
