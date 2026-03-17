@@ -42,7 +42,7 @@ services:
     # Then use the `image` directive instead of `build`.
     image: ghcr.io/optimce/kc-groupid-mapper:main
     restart: unless-stopped
-    command: ["start", "--import-realm", "--verbose", "--proxy-headers=xforwarded", "--http-relative-path=/keycloak"]
+    command: ["start", "--import-realm", "--proxy-headers=xforwarded", "--http-relative-path=/keycloak"]
     environment:
       - KC_BOOTSTRAP_ADMIN_USERNAME=${KEYCLOAK_ADMIN:-admin}
       - KC_BOOTSTRAP_ADMIN_PASSWORD=${KEYCLOAK_ADMIN_PASSWORD}
@@ -76,11 +76,11 @@ services:
       - keycloak
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://keycloak:9000/health/ready || exit 1"]
+      test: ["CMD-SHELL", "curl --head -fsS http://keycloak:9000/keycloak/health/ready || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 30s
+      start_period: 15s
 
   openfiles:
     profiles: ["backend"]
@@ -157,6 +157,9 @@ services:
       - ./nginx/certs:/etc/nginx/certs
     networks:
       - reverse-proxy
+    depends_on:
+      crm-frontend:
+        condition: service_started
 
   crm-backend:
     profiles: ["backend"]
@@ -186,8 +189,8 @@ services:
       - DB_TYPE=postgres
       - DB_HOST=crm-database
       - DB_PORT=5432
-      - DB_USERNAME=${DB_USERNAME:-postgres}
-      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_USERNAME=${CRM_DB_USERNAME:-postgres}
+      - DB_PASSWORD=${CRM_DB_PASSWORD}
       - DB_NAME=crm_db
     networks:
       - api-gateway
