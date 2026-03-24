@@ -1,0 +1,3 @@
+docker-compose/krakend_config/swagger.yaml
+docker-compose/krakend_config/krakend.json
+docker-compose/crm-frontend-config/config.json

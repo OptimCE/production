@@ -4,8 +4,8 @@ services:
     image: postgres:18-alpine
     restart: unless-stopped
     environment:
-      - POSTGRES_USER=${CRM_DB_USERNAME:-postgres}
-      - POSTGRES_DB=${CRM_DB_NAME:-crm_db}
+      - POSTGRES_USER=postgres
+      - POSTGRES_DB=crm_db
       - POSTGRES_PASSWORD=${CRM_DB_PASSWORD}
     volumes:
       - crm_db_data:/var/lib/postgresql/data
@@ -23,8 +23,8 @@ services:
     image: postgres:18-alpine
     restart: unless-stopped
     environment:
-      - POSTGRES_USER=${KEYCLOAK_DB_USERNAME:-postgres}
-      - POSTGRES_DB=${KEYCLOAK_DB_NAME:-keycloak}
+      - POSTGRES_USER=postgres
+      - POSTGRES_DB=keycloak
       - POSTGRES_PASSWORD=${KEYCLOAK_DB_PASSWORD}
     volumes:
       - keycloak_db_data:/var/lib/postgresql/data
@@ -36,24 +36,32 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+
+  keycloak-config:
+    profiles: ["init"]
+    image: ghcr.io/ourouk/alpine-envsubst:main
+    env_file:
+      - .env
+    volumes:
+      - ./keycloak:/config
+    command:
+      - < /config/prod-config.template.json > /config/prod-config.json
   keycloak:
     profiles: ["backend"]
     # In production, you should build the image and push it to a registry.
     # Then use the `image` directive instead of `build`.
     image: ghcr.io/optimce/kc-groupid-mapper:main
     restart: unless-stopped
-    command: ["start", "--import-realm", "--verbose" ]
-    ports:
-      - "8080:8080"
+    command: ["start", "--import-realm", "--health-enabled=true", "--metrics-enabled=true", "--proxy-headers=xforwarded", "--http-relative-path=/keycloak"]
     environment:
-      - KC_BOOTSTRAP_ADMIN_USERNAME=${KEYCLOAK_ADMIN:-admin}
-      - KC_BOOTSTRAP_ADMIN_PASSWORD=${KEYCLOAK_ADMIN_PASSWORD}
+      - KC_BOOTSTRAP_ADMIN_USERNAME=admin
+      - KC_BOOTSTRAP_ADMIN_PASSWORD=${KEYCLOAK_BOOTSTRAP_ADMIN_PASSWORD}
       - KEYCLOAK_IMPORT=/opt/keycloak/data/import/prod-config.json
       - KC_DB=postgres
       - KC_DB_URL=jdbc:postgresql://keycloak-db:5432/keycloak
-      - KC_DB_USERNAME=${KC_DB_USERNAME:-postgres}
-      - KC_DB_PASSWORD=${KC_DB_PASSWORD}
-      - KC_HOSTNAME=${KC_HOSTNAME:-localhost}
+      - KC_DB_USERNAME=postgres
+      - KC_DB_PASSWORD=${KEYCLOAK_DB_PASSWORD}
+      - KC_HOSTNAME=${KEYCLOAK_HOSTNAME:-localhost}
       - KC_HTTP_ENABLED=true  # Required for health endpoints
       - KC_HEALTH_ENABLED=true  # Explicitly enable health endpoints (if needed)
       - KC_METRICS_ENABLED=true  # Optional: Enable metrics if you want additional monitoring
@@ -78,19 +86,19 @@ services:
       - keycloak
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://keycloak:9000/health/ready || exit 1"]
+      test: ["CMD-SHELL", "curl --head -fsS http://keycloak:9000/keycloak/health/ready || exit 1"]
       interval: 10s
       timeout: 5s
-      retries: 5
-      start_period: 30s
+      retries: 12
+      start_period: 15s
 
   openfiles:
     profiles: ["backend"]
     image: totalplatform/openfiles:latest
     restart: unless-stopped
     environment:
-      - OPENFILES_PORT=${OPENFILES_PORT:-8001}
-      - OPENFILES_DATA_PATH=${OPENFILES_DATA_PATH:-/var/lib/openfiles}
+      - OPENFILES_PORT=8001
+      - OPENFILES_DATA_PATH=/var/lib/openfiles
     volumes:
       - openfiles_data:/var/lib/openfiles
     networks:
@@ -114,21 +122,21 @@ services:
     image: alpine/curl:latest
     command: ["-fL", "https://optimce.github.io/crm-backend/swagger.yml", "-o", "/data/swagger.yaml"]
     volumes:
-      - krakend_config:/data:z
+      - ./krakend_config:/data:z
     restart: on-failure
 
   krakend-config:
     profiles: ["init"]
     image: ghcr.io/optimce/swagger2krakend:main
     volumes:
-      - krakend_config:/etc/krakend
+      - ./krakend_config:/etc/krakend
     environment:
       - SWAGGER_FILE=/etc/krakend/swagger.yaml
       - OUTPUT_FILE=/etc/krakend/krakend.json
-      - KEYCLOAK_URL=http://keycloak:8080
-      - REALM_NAME=optimce-realm
+      - KEYCLOAK_URL=${AUTH_INTERNAL_URL:-http://keycloak:8080}/keycloak
+      - REALM_NAME=${AUTH_REALM:-optimce-realm}
       - BACKEND_HOST=http://crm-backend:80
-      - ISSUER_URL=http://keycloak:8080/realms/optimce-realm
+      - ISSUER=${WEB_AUTH_URL:-http://localhost/keycloak}/realms/${AUTH_REALM:-optimce-realm}
     restart: on-failure
     depends_on:
       swagger-doc-gen:
@@ -137,10 +145,8 @@ services:
   krakend:
     profiles: ["backend"]
     image: krakend:latest
-    ports:
-      - "8090:8080"
     volumes:
-      - krakend_config:/etc/krakend
+      - ./krakend_config:/etc/krakend
     networks:
       - api-gateway
       - reverse-proxy
@@ -161,6 +167,9 @@ services:
       - ./nginx/certs:/etc/nginx/certs
     networks:
       - reverse-proxy
+    depends_on:
+      crm-frontend:
+        condition: service_started
 
   crm-backend:
     profiles: ["backend"]
@@ -169,30 +178,29 @@ services:
     restart: unless-stopped
     environment:
       - NODE_ENV=production
-      - PORT=80
       - MICROSERVICE_NAME=crm-backend
-      - ALLOWED_ORIGIN=${ALLOWED_ORIGIN:-http://localhost:4200}
+      - ALLOWED_ORIGIN=${APP_CORS_ALLOWED_ORIGIN:-http://localhost}
       - SERVER_HOST=0.0.0.0
       - SERVER_PORT=80
-      - IAM_SERVICE_NAME=${IAM_SERVICE_NAME:-KEYCLOAK}
-      - IAM_REALM=${IAM_REALM:-optimce-realm}
-      - IAM_REALM_NAME=${IAM_REALM_NAME:-optimce-realm}
-      - IAM_BASE_URL=${IAM_BASE_URL:-http://keycloak:8080}
-      - IAM_CLIENT_ID=${IAM_CLIENT_ID:-optimce-backend}
-      - IAM_GRANT_TYPE=${IAM_GRANT_TYPE:-client_credentials}
-      - IAM_CLIENT_SECRET=${IAM_CLIENT_SECRET}
+      - IAM_SERVICE_NAME=KEYCLOAK
+      - IAM_REALM=${AUTH_REALM:-optimce-realm}
+      - IAM_REALM_NAME=${AUTH_REALM:-optimce-realm}
+      - IAM_BASE_URL=${AUTH_INTERNAL_URL:-http://keycloak:8080}
+      - IAM_CLIENT_ID=optimce-backend
+      - IAM_GRANT_TYPE=client_credentials
+      - IAM_CLIENT_SECRET=${AUTH_CLIENT_SECRET}
       - STORAGE_SERVICE_NAME=openfiles
       - STORAGE_TARGET=http://openfiles:8001
       - STORAGE_DB_NAME=crm_files
-      - STORAGE_TOKEN=${STORAGE_TOKEN}
+      - STORAGE_TOKEN=${STORAGE_SERVICE_TOKEN}
       - REMOTE_LOGGING=true
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
       - OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
       - DB_TYPE=postgres
       - DB_HOST=crm-database
       - DB_PORT=5432
-      - DB_USERNAME=${DB_USERNAME:-postgres}
-      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_USERNAME=postgres
+      - DB_PASSWORD=${CRM_DB_PASSWORD}
       - DB_NAME=crm_db
     networks:
       - api-gateway
@@ -218,14 +226,13 @@ services:
     volumes:
       - ./crm-frontend-config:/config
     command: 
-    - "< /config/config.template.json > /config/config.json"
+      - < /config/config.template.json > /config/config.json
 
   crm-frontend:
     profiles: ["frontend"]
     image: ghcr.io/optimce/crm-frontend:main
     volumes:
-      - ./crm-frontend-config/config.json:/usr/share/nginx/html/assets/config.json
-      # - ./nginx/conf.d/default.conf:/etc/nginx/conf.d/default.conf
+      - ./crm-frontend-config/config.json:/usr/share/nginx/html/assets/config/config.json
     networks:
       - reverse-proxy
 
