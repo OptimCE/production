@@ -9,6 +9,7 @@ services:
       - POSTGRES_PASSWORD=${CRM_DB_PASSWORD}
     volumes:
       - crm_db_data:/var/lib/postgresql/data
+      - ./crm-backend-db/docker-entrypoint-initdb.d:/docker-entrypoint-initdb.d
     networks:
       - crm
     healthcheck:
@@ -43,7 +44,7 @@ services:
     env_file:
       - .env
     volumes:
-      - ./keycloak:/config
+      - ./keycloak/realm:/config
     command:
       - < /config/prod-config.template.json > /config/prod-config.json
   keycloak:
@@ -133,7 +134,7 @@ services:
     environment:
       - SWAGGER_FILE=/etc/krakend/swagger.yaml
       - OUTPUT_FILE=/etc/krakend/krakend.json
-      - KEYCLOAK_URL=${AUTH_INTERNAL_URL:-http://keycloak:8080}/keycloak
+      - KEYCLOAK_URL=${AUTH_INTERNAL_URL:-http://keycloak:8080}
       - REALM_NAME=${AUTH_REALM:-optimce-realm}
       - BACKEND_HOST=http://crm-backend:80
       - ISSUER=${WEB_AUTH_URL:-http://localhost/keycloak}/realms/${AUTH_REALM:-optimce-realm}
@@ -185,7 +186,7 @@ services:
       - IAM_SERVICE_NAME=KEYCLOAK
       - IAM_REALM=${AUTH_REALM:-optimce-realm}
       - IAM_REALM_NAME=${AUTH_REALM:-optimce-realm}
-      - IAM_BASE_URL=${AUTH_INTERNAL_URL:-http://keycloak:8080}
+      - IAM_BASE_URL=${AUTH_INTERNAL_URL:-http://keycloak:8080/keycloak}
       - IAM_CLIENT_ID=optimce-backend
       - IAM_GRANT_TYPE=client_credentials
       - IAM_CLIENT_SECRET=${AUTH_CLIENT_SECRET}

@@ -58,7 +58,7 @@
       "clientId": "optimce-backend",
       "enabled": true,
       "clientAuthenticatorType": "client-secret",
-      "secret": "changeme_keycloak_admin_password",
+      "secret": "${AUTH_CLIENT_SECRET}",
       "bearerOnly": false,
       "standardFlowEnabled": false,
       "directAccessGrantsEnabled": true,
