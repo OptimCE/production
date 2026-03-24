@@ -36,6 +36,16 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+
+  keycloak-config:
+    profiles: ["init"]
+    image: ghcr.io/ourouk/alpine-envsubst:main
+    env_file:
+      - .env
+    volumes:
+      - ./keycloak:/config
+    command:
+      - < /config/prod-config.template.json > /config/prod-config.json
   keycloak:
     profiles: ["backend"]
     # In production, you should build the image and push it to a registry.
