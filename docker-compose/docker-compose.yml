@@ -17,6 +17,15 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+  keycloak-config:
+    profiles: ["init"]
+    image: ghcr.io/ourouk/alpine-envsubst:main
+    env_file:
+      - .env
+    volumes:
+      - ./keycloak/realm:/config
+    command:
+      - < /config/prod-config.template.json > /config/prod-config.json
 
   keycloak-db:
     profiles: ["backend"]
@@ -65,6 +74,7 @@ services:
       keycloak-db:
         condition: service_healthy
 
+
   # Sidecar container to check Keycloak health before starting dependent services
   keycloak-healthcheck:
     image: alpine/curl
@@ -110,7 +120,7 @@ services:
     profiles: ["init"]
     # user: 0:0
     image: alpine/curl:latest
-    command: ["-fL", "https://optimce.github.io/crm-backend/swagger.yml", "-o", "/data/swagger.yaml"]
+    command: ["-fL", "https://optimce.github.io/crm-backend/swagger.yml", "-o", "/data/root.yaml"]
     volumes:
       - ./krakend_config:/data:z
     restart: on-failure
@@ -121,7 +131,7 @@ services:
     volumes:
       - ./krakend_config:/etc/krakend
     environment:
-      - SWAGGER_FILE=/etc/krakend/swagger.yaml
+      - SWAGGER_FILE=/etc/krakend/root.yaml
       - OUTPUT_FILE=/etc/krakend/krakend.json
       - KEYCLOAK_URL=${AUTH_INTERNAL_URL:-http://keycloak:8080}/keycloak
       - REALM_NAME=${AUTH_REALM:-optimce-realm}
