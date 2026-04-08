@@ -131,12 +131,8 @@ services:
     volumes:
       - ./krakend_config:/etc/krakend
     environment:
-      - SWAGGER_FILE=/etc/krakend/root.yaml
-      - OUTPUT_FILE=/etc/krakend/krakend.json
-      - KEYCLOAK_URL=${AUTH_INTERNAL_URL:-http://keycloak:8080}/keycloak
-      - REALM_NAME=${AUTH_REALM:-optimce-realm}
-      - BACKEND_HOST=http://crm-backend:80
-      - ISSUER=${WEB_AUTH_URL:-http://localhost/keycloak}/realms/${AUTH_REALM:-optimce-realm}
+      - CONFIG_FILE=/config/krakend-builder.yaml
+      - OUTPUT_FILE=/config/krakend.json
     restart: on-failure
     depends_on:
       swagger-doc-gen:
