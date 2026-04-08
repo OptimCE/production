@@ -1,5 +1,4 @@
-docker-compose/krakend_config/swagger.yaml
 docker-compose/krakend_config/krakend.json
+docker-compose/krakend_config/root.yaml
 docker-compose/crm-frontend-config/config.json
-docker-compose/docker-compose.yml
 docker-compose/keycloak/realm/prod-config.json
