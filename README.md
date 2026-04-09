@@ -15,6 +15,7 @@ Docker-based microservices infrastructure for a Customer Relationship Management
 | **YAML** | `docker-compose/docker-compose.yml` | Container orchestration |
 | **JSON** | `docker-compose/keycloak/realm/prod-config.json` | Keycloak realm configuration |
 | **JSON** | `docker-compose/crm-frontend-config/config.json` | Frontend runtime config |
+| **YAML** | `docker-compose/krakend_config/krakend-builder.yaml` | KrakenD template-driven endpoint configuration |
 | **Bash** | `docker-stack.sh` | Deployment automation |
 | **NGINX Conf** | `docker-compose/nginx/conf.d/default.conf` | Reverse proxy routing |
 
@@ -41,3 +42,5 @@ Docker-based microservices infrastructure for a Customer Relationship Management
 ## Configuration
 
 Edit `docker-compose/.env` to configure URLs, auth settings, and database credentials.
+
+> Note: `docker-compose/krakend_config/krakend-builder.yaml` is the source template for KrakenD service definitions. Update this file when changing upstream service hosts, realm-related variables, or endpoint generation inputs.
