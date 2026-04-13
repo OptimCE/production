@@ -1,11 +1,11 @@
 {
-	"apiUrl": "${WEB_API_URL}",
+	"apiUrl": "${DOMAIN}${WEB_API_URL}",
 	"basePath": "${WEB_BASE_PATH}",
 	"keycloak": {
 		"realm": "${AUTH_REALM}",
-		"url": "${WEB_AUTH_URL}",
+		"url": "${DOMAIN}${WEB_AUTH_URL}",
 		"clientId": "${WEB_AUTH_CLIENT_ID}",
-		"urlPattern": "^(${WEB_API_URL})(/.*)?$",
+		"urlPattern": "^(${DOMAIN}${WEB_API_URL})(/.*)?$",
 		"urlPatternFlags": "i"
 	}
 }

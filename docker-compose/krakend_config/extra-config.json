@@ -1,0 +1,14 @@
+{
+  "auth/validator": {
+    "alg": "RS256",
+    "jwk_url": "{{ KEYCLOAK_URL }}/realms/{{ REALM_NAME }}/protocol/openid-connect/certs",
+    "disable_jwk_security": true,
+    "issuer": "{{ ISSUER }}",
+    "propagate_claims": [
+      ["sub", "x-user-id"],
+      ["groups", "x-user-groups"],
+      ["orgs", "x-user-orgs"]
+    ],
+    "cache": true
+  }
+}
