@@ -95,11 +95,13 @@ services:
       start_period: 15s
 
   minio:
-    profiles: ["dev"]
+    profiles: ["backend"]
     image: minio/minio:latest
-    command: server /data --console-address ":9001"
     restart: unless-stopped
+    command: server /data --console-address ":9001"
     environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
       - MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}
       - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}
     ports:
