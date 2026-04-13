@@ -94,17 +94,47 @@ services:
       retries: 12
       start_period: 15s
 
-  openfiles:
-    profiles: ["backend"]
-    image: totalplatform/openfiles:latest
+  minio:
+    profiles: ["dev"]
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
     restart: unless-stopped
     environment:
-      - OPENFILES_PORT=8001
-      - OPENFILES_DATA_PATH=/var/lib/openfiles
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
     volumes:
-      - openfiles_data:/var/lib/openfiles
+      - minio_data:/data
     networks:
-      - openfiles
+      - minio
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  minio-init:
+    profiles: ["dev"]
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}
+      - STORAGE_BUCKET=${STORAGE_BUCKET:-crm-files}
+    entrypoint: >
+      /bin/sh -c "
+      sleep 5;
+      mc alias set local http://minio:9000 $${MINIO_ROOT_USER:-minioadmin} $${MINIO_ROOT_PASSWORD:-minioadmin};
+      mc mb --ignore-existing local/$${STORAGE_BUCKET:-crm-files};
+      exit 0;
+      "
+    networks:
+      - minio
 
   jaeger:
     profiles: ["backend"]
@@ -187,10 +217,12 @@ services:
       - IAM_CLIENT_ID=optimce-backend
       - IAM_GRANT_TYPE=client_credentials
       - IAM_CLIENT_SECRET=${AUTH_CLIENT_SECRET}
-      - STORAGE_SERVICE_NAME=openfiles
-      - STORAGE_TARGET=http://openfiles:8001
-      - STORAGE_DB_NAME=crm_files
-      - STORAGE_TOKEN=${STORAGE_SERVICE_TOKEN}
+      - STORAGE_SERVICE_NAME=S3
+      - STORAGE_ENDPOINT=http://minio:9000
+      - STORAGE_REGION=us-east-1
+      - STORAGE_BUCKET=${STORAGE_BUCKET:-crm-files}
+      - STORAGE_ACCESS_KEY=${MINIO_ROOT_USER:-minioadmin}
+      - STORAGE_SECRET_KEY=${MINIO_ROOT_PASSWORD:-minioadmin}
       - REMOTE_LOGGING=true
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
       - OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
@@ -204,14 +236,14 @@ services:
       - api-gateway
       - crm
       - keycloak
-      - openfiles
+      - minio
       - opentelemetry
     depends_on:
       crm-database:
         condition: service_healthy
       keycloak-healthcheck:
         condition: service_healthy
-      openfiles:
+      minio:
         condition: service_started
       jaeger:
         condition: service_started
@@ -237,7 +269,7 @@ services:
 volumes:
   crm_db_data:
   keycloak_db_data:
-  openfiles_data:
+  minio_data:
   krakend_config:
   keycloak_data:
 
@@ -246,5 +278,5 @@ networks:
   api-gateway:
   crm:
   keycloak:
-  openfiles:
+  minio:
   opentelemetry:
