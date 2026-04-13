@@ -187,6 +187,19 @@ services:
       keycloak:
         condition: service_started
 
+  nginx-config:
+    profiles: ["frontend"]
+    image: ghcr.io/ourouk/alpine-envsubst:main
+    env_file:
+      - .env
+    volumes:
+      - ./nginx/conf.d:/config
+    command:
+      - < /config/default.conf.template > /config/default.conf
+    depends_on:
+      crm-frontend:
+        condition: service_started
+
   reverse-proxy:
     profiles: ["frontend"]
     image: nginx:latest
@@ -199,9 +212,23 @@ services:
     networks:
       - reverse-proxy
       - minio
+      - api-gateway
+      - keycloak
+      - crm
     depends_on:
-      crm-frontend:
-        condition: service_started
+      nginx-config:
+        condition: service_completed_successfully
+
+  certbot:
+    profiles: ["frontend"]
+    image: certbot/certbot:latest
+    volumes:
+      - ./nginx/certs:/etc/letsencrypt
+      - ./nginx/certbot-webroot:/webroot
+    command: certonly --webroot -w /webroot -d ${DOMAIN_HOST} --agree-tos -m ${SSL_EMAIL} --non-interactive
+    environment:
+      - DOMAIN_HOST=${DOMAIN_HOST}
+      - SSL_EMAIL=${SSL_EMAIL}
 
   crm-backend:
     profiles: ["backend"]
