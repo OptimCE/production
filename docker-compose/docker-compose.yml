@@ -187,19 +187,6 @@ services:
       keycloak:
         condition: service_started
 
-  nginx-config:
-    profiles: ["frontend"]
-    image: ghcr.io/ourouk/alpine-envsubst:main
-    env_file:
-      - .env
-    volumes:
-      - ./nginx/conf.d:/config
-    command:
-      - < /config/default.conf.template > /config/default.conf
-    depends_on:
-      crm-frontend:
-        condition: service_started
-
   reverse-proxy:
     profiles: ["frontend"]
     image: nginx:latest
@@ -215,9 +202,6 @@ services:
       - api-gateway
       - keycloak
       - crm
-    depends_on:
-      nginx-config:
-        condition: service_completed_successfully
 
   certbot:
     profiles: ["frontend"]
