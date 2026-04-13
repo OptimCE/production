@@ -12,12 +12,19 @@ if "%~1"=="" goto :usage
 
 set "COMMAND=%~1"
 shift
+set "REST="
+:collect_args
+if "%~1"=="" goto :done_collect
+set "REST=!REST! %~1"
+shift
+goto :collect_args
+:done_collect
 
 call :resolve_compose_cmd
 if errorlevel 1 exit /b 1
 
 if /i "%COMMAND%"=="start" (
-    call :parse_start_options %*
+    call :parse_start_options !REST!
     if errorlevel 1 exit /b 1
     call :start_stack
     exit /b %errorlevel%
@@ -27,7 +34,7 @@ if /i "%COMMAND%"=="stop" (
     exit /b %errorlevel%
 )
 if /i "%COMMAND%"=="restart" (
-    call :parse_start_options %*
+    call :parse_start_options !REST!
     if errorlevel 1 exit /b 1
     call :stop_stack
     call :start_stack
