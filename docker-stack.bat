@@ -115,8 +115,24 @@ timeout /t %WAIT_BACKEND_SECONDS% /nobreak >nul
 exit /b %errorlevel%
 
 :stop_stack
+echo Running backups before stopping...
+call :do_backup
 %DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --profile init --profile backend --profile frontend down
 exit /b %errorlevel%
+
+:do_backup
+echo Backing up CRM database...
+%DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --profile backup run --rm crm-database-backup
+if errorlevel 1 (
+    echo CRM backup failed
+)
+echo Backing up Keycloak database...
+%DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --profile backup run --rm keycloak-db-backup
+if errorlevel 1 (
+    echo Keycloak backup failed
+)
+echo Backups completed.
+exit /b 0
 
 :parse_start_options
 if "%~1"=="" exit /b 0
