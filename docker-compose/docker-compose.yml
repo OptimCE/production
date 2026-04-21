@@ -13,7 +13,11 @@ services:
     networks:
       - crm
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB -h localhost || exit 1"]
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB -h localhost || exit 1",
+        ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -41,7 +45,11 @@ services:
     networks:
       - keycloak
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB -h localhost || exit 1"]
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB -h localhost || exit 1",
+        ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -53,7 +61,15 @@ services:
     # Then use the `image` directive instead of `build`.
     image: ghcr.io/optimce/kc-groupid-mapper:main
     restart: unless-stopped
-    command: ["start", "--import-realm", "--health-enabled=true", "--metrics-enabled=true", "--proxy-headers=xforwarded", "--http-relative-path=/keycloak"]
+    command:
+      [
+        "start",
+        "--import-realm",
+        "--health-enabled=true",
+        "--metrics-enabled=true",
+        "--proxy-headers=xforwarded",
+        "--http-relative-path=/keycloak",
+      ]
     environment:
       - KC_BOOTSTRAP_ADMIN_USERNAME=admin
       - KC_BOOTSTRAP_ADMIN_PASSWORD=${KEYCLOAK_BOOTSTRAP_ADMIN_PASSWORD}
@@ -63,32 +79,35 @@ services:
       - KC_DB_USERNAME=postgres
       - KC_DB_PASSWORD=${KEYCLOAK_DB_PASSWORD}
       - KC_HOSTNAME=${KEYCLOAK_HOSTNAME}
-      - KC_HTTP_ENABLED=true  # Required for health endpoints
-      - KC_HEALTH_ENABLED=true  # Explicitly enable health endpoints (if needed)
-      - KC_METRICS_ENABLED=true  # Optional: Enable metrics if you want additional monitoring
+      - KC_HTTP_ENABLED=true # Required for health endpoints
+      - KC_HEALTH_ENABLED=true # Explicitly enable health endpoints (if needed)
+      - KC_METRICS_ENABLED=true # Optional: Enable metrics if you want additional monitoring
     volumes:
       - ./keycloak/realm/prod-config.json:/opt/keycloak/data/import/prod-config.json
     networks:
       - keycloak
       - api-gateway
       - reverse-proxy
-    depends_on: 
+    depends_on:
       keycloak-db:
         condition: service_healthy
-
 
   # Sidecar container to check Keycloak health before starting dependent services
   keycloak-healthcheck:
     image: alpine/curl
     profiles: ["backend"]
-    command: ["tail", "-f", "/dev/null"]  # Sleep forever
+    command: ["tail", "-f", "/dev/null"] # Sleep forever
     networks:
       - keycloak
     depends_on:
       - keycloak
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "curl --head -fsS http://keycloak:9000/keycloak/health/ready || exit 1"]
+      test:
+        [
+          "CMD-SHELL",
+          "curl --head -fsS http://keycloak:9000/keycloak/health/ready || exit 1",
+        ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -136,23 +155,17 @@ services:
     networks:
       - minio
 
-  jaeger:
-    profiles: ["backend"]
-    image: jaegertracing/jaeger:latest
-    restart: unless-stopped
-    ports:
-      - "6831:6831/udp"
-      - "16686:16686"
-    environment:
-      - COLLECTOR_OTLP_ENABLED=true
-    networks:
-      - opentelemetry
-
   swagger-doc-gen:
     profiles: ["init"]
     # user: 0:0
     image: alpine/curl:latest
-    command: ["-fL", "https://optimce.github.io/crm-backend/swagger.yml", "-o", "/data/root.yaml"]
+    command:
+      [
+        "-fL",
+        "https://optimce.github.io/crm-backend/swagger.yml",
+        "-o",
+        "/data/root.yaml",
+      ]
     volumes:
       - ./krakend_config:/data:z
     restart: on-failure
@@ -239,8 +252,8 @@ services:
       - STORAGE_ACCESS_KEY=${MINIO_ROOT_USER}
       - STORAGE_SECRET_KEY=${MINIO_ROOT_PASSWORD}
       - STORAGE_PUBLIC_ENDPOINT=${MINIO_PUBLIC_ENDPOINT}
-      - REMOTE_LOGGING=true
-      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
+      - REMOTE_LOGGING=${REMOTE_LOGGING}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT}
       - OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
       - DB_TYPE=postgres
       - DB_HOST=crm-database
@@ -261,17 +274,15 @@ services:
         condition: service_healthy
       minio:
         condition: service_started
-      jaeger:
-        condition: service_started
 
   crm-frontend-config:
-    profiles : ["init"]
+    profiles: ["init"]
     image: ghcr.io/ourouk/alpine-envsubst:main
     env_file:
       - .env
     volumes:
       - ./crm-frontend-config:/config
-    command: 
+    command:
       - < /config/config.template.json > /config/config.json
 
   crm-frontend:
