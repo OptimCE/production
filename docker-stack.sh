@@ -19,8 +19,8 @@ Commands:
 
 Options (for start/restart):
     --no-pull                  Skip image pull before starting
-    --wait-init <seconds>      Wait after init profile (default: 30)
-    --wait-backend <seconds>   Wait after backend profile (default: 30)
+    --wait-init <seconds>      Wait after init profile (default: 10)
+    --wait-backend <seconds>   Wait after backend profile (default: 10)
 EOF
 }
 
@@ -81,9 +81,9 @@ stop_stack() {
 
 do_backup() {
     echo "Backing up CRM database..."
-    compose -f "$COMPOSE_FILE" --profile backup run --rm crm-database-backup || echo "CRM backup failed"
+    compose -f "$COMPOSE_FILE" --profile backup --env-file "$ENV_FILE" run --rm crm-database-backup || echo "CRM backup failed"
     echo "Backing up Keycloak database..."
-    compose -f "$COMPOSE_FILE" --profile backup run --rm keycloak-db-backup || echo "Keycloak backup failed"
+    compose -f "$COMPOSE_FILE" --profile backup --env-file "$ENV_FILE" run --rm keycloak-db-backup|| echo "Keycloak backup failed"
     echo "Backups completed."
 }
 

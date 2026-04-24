@@ -80,6 +80,7 @@ services:
       - POSTGRES_USER=postgres
       - POSTGRES_DB=crm_db
       - POSTGRES_PASSWORD=${CRM_DB_PASSWORD}
+      - PGDATA=/var/lib/postgresql/data
     volumes:
       - crm_db_data:/var/lib/postgresql/data
       - ./crm-backend-db/docker-entrypoint-initdb.d:/docker-entrypoint-initdb.d
@@ -104,6 +105,7 @@ services:
       - POSTGRES_USER=postgres
       - POSTGRES_DB=keycloak
       - POSTGRES_PASSWORD=${KEYCLOAK_DB_PASSWORD}
+      - PGDATA=/var/lib/postgresql/data
     volumes:
       - keycloak_db_data:/var/lib/postgresql/data
     networks:
@@ -326,7 +328,6 @@ services:
     command: >
       sh -c '
         pg_dump -h crm-database -U postgres -d crm_db -f /backups/crm_db_$(date +%Y%m%d_%H%M%S).sql ;
-        find /backups -name "crm_db_*.sql" -mtime +7 -delete
       '
     networks:
       - crm
@@ -341,7 +342,6 @@ services:
     command: >
       sh -c '
         pg_dump -h keycloak-db -U postgres -d keycloak -f /backups/keycloak_$(date +%Y%m%d_%H%M%S).sql ;
-        find /backups -name "keycloak_*.sql" -mtime +7 -delete
       '
     networks:
       - keycloak
