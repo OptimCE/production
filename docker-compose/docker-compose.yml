@@ -7,8 +7,9 @@ services:
       - POSTGRES_USER=postgres
       - POSTGRES_DB=crm_db
       - POSTGRES_PASSWORD=${CRM_DB_PASSWORD}
+      - PGDATA=/var/lib/postgresql/data
     volumes:
-      - crm_db_data:/var/lib/postgresql/18/docker
+      - crm_db_data:/var/lib/postgresql/data
       - ./crm-backend-db/docker-entrypoint-initdb.d:/docker-entrypoint-initdb.d
     networks:
       - crm
@@ -36,8 +37,9 @@ services:
       - POSTGRES_USER=postgres
       - POSTGRES_DB=keycloak
       - POSTGRES_PASSWORD=${KEYCLOAK_DB_PASSWORD}
+      - PGDATA=/var/lib/postgresql/data
     volumes:
-      - keycloak_db_data:/var/lib/postgresql/18/docker
+      - keycloak_db_data:/var/lib/postgresql/data
     networks:
       - keycloak
     healthcheck:
