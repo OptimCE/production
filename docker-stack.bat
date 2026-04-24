@@ -122,12 +122,12 @@ exit /b %errorlevel%
 
 :do_backup
 echo Backing up CRM database...
-%DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --profile backup run --rm crm-database-backup
+%DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" --profile backup run --rm crm-database-backup
 if errorlevel 1 (
     echo CRM backup failed
 )
 echo Backing up Keycloak database...
-%DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --profile backup run --rm keycloak-db-backup
+%DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" --profile backup run --rm keycloak-db-backup
 if errorlevel 1 (
     echo Keycloak backup failed
 )
