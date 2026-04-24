@@ -28,7 +28,6 @@ Docker-based microservices infrastructure for a Customer Relationship Management
 | crm-database | PostgreSQL | internal |
 | keycloak | IAM/OIDC | http://localhost/keycloak |
 | krakend | API Gateway | http://localhost/api |
-| jaeger | Distributed tracing | http://localhost:16686 |
 | minio | S3-compatible storage | internal |
 | reverse-proxy | NGINX reverse proxy | http://localhost |
 
@@ -47,8 +46,8 @@ Docker Compose profiles control which services start:
 
 | Profile | Services | Purpose |
 |---------|----------|---------|
-| `backend` | crm-database, keycloak, crm-backend, jaeger, minio, krakend | Core infrastructure |
-| `frontend` | reverse-proxy, crm-frontend, certbot | Web serving layer |
+| `backend` | crm-database, keycloak, crm-backend, minio, krakend | Core infrastructure |
+| `frontend` | reverse-proxy, crm-frontend | Web serving layer |
 | `init` | keycloak-config, swagger-doc-gen, krakend-config, crm-frontend-config | One-shot config generators |
 | `backup` | crm-database-backup, keycloak-db-backup | Database backup services |
 
