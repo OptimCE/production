@@ -321,7 +321,6 @@ services:
     image: postgres:18-alpine
     volumes:
       - ./backups:/backups
-      - crm_db_data:/var/lib/postgresql/data:ro
     environment:
       - PGPASSWORD=${CRM_DB_PASSWORD}
     command: >
@@ -337,7 +336,6 @@ services:
     image: postgres:18-alpine
     volumes:
       - ./backups:/backups
-      - keycloak_db_data:/var/lib/postgresql/data:ro
     environment:
       - PGPASSWORD=${KEYCLOAK_DB_PASSWORD}
     command: >
