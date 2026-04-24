@@ -3,8 +3,8 @@ set -euo pipefail
 
 COMPOSE_FILE="docker-compose/docker-compose.yml"
 ENV_FILE="docker-compose/.env"
-WAIT_INIT_SECONDS=30
-WAIT_BACKEND_SECONDS=30
+WAIT_INIT_SECONDS=10
+WAIT_BACKEND_SECONDS=10
 PULL_IMAGES=true
 
 usage() {
@@ -12,15 +12,15 @@ usage() {
 Usage: ./docker-stack.sh <command> [options]
 
 Commands:
-  start      Pull images (optional) and start init, backend, then frontend
-  stop       Stop init, backend, and frontend profiles
-  restart    Stop then start
-  help       Show this help message
+    start      Pull images (optional) and start init, backend, then frontend
+    stop       Stop init, backend, and frontend profiles
+    restart    Stop then start
+    help       Show this help message
 
 Options (for start/restart):
-  --no-pull                  Skip image pull before starting
-  --wait-init <seconds>      Wait after init profile (default: 30)
-  --wait-backend <seconds>   Wait after backend profile (default: 30)
+    --no-pull                  Skip image pull before starting
+    --wait-init <seconds>      Wait after init profile (default: 10)
+    --wait-backend <seconds>   Wait after backend profile (default: 10)
 EOF
 }
 
@@ -74,7 +74,17 @@ start_stack() {
 }
 
 stop_stack() {
+    echo "Running backups before stopping..."
+    do_backup
     compose -f "$COMPOSE_FILE" --profile init --profile backend --profile frontend down
+}
+
+do_backup() {
+    echo "Backing up CRM database..."
+    compose -f "$COMPOSE_FILE" --profile backup --env-file "$ENV_FILE" run --rm crm-database-backup || echo "CRM backup failed"
+    echo "Backing up Keycloak database..."
+    compose -f "$COMPOSE_FILE" --profile backup --env-file "$ENV_FILE" run --rm keycloak-db-backup|| echo "Keycloak backup failed"
+    echo "Backups completed."
 }
 
 parse_start_options() {
