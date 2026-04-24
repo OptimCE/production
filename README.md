@@ -63,8 +63,8 @@ Backups run automatically before `stop` or `restart`:
 
 Manual backup:
 ```bash
-docker-compose --profile backup run --rm crm-database-backup
-docker-compose --profile backup run --rm keycloak-db-backup
+docker compose -f docker-compose/docker-compose.yml --profile backup run --rm crm-database-backup
+docker compose -f docker-compose/docker-compose.yml --profile backup run --rm keycloak-db-backup
 ```
 
 Backups are stored in `docker-compose/backups/`.
