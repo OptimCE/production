@@ -58,7 +58,7 @@ Default startup uses `backend` + `frontend` profiles.
 Backups run automatically before `stop` or `restart`:
 - CRM database → `backups/crm_db_YYYYMMDD_HHMMSS.sql`
 - Keycloak database → `backups/keycloak_YYYYMMDD_HHMMSS.sql`
-- Retention: files older than 7 days are auto-deleted
+- Retention cleanup is not currently implemented; old backup files must be removed manually
 
 Manual backup:
 ```bash
