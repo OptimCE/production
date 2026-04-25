@@ -69,6 +69,48 @@ services:
     command:
       - < /config/config.template.json > /config/config.json
 
+
+  keycloak-group-id-mapper:
+    profiles: ["init"]
+    image: alpine/curl:latest
+    command:
+      - "-fL"
+      - "https://github.com/OptimCE/kc-groupid-mapper/releases/download/v0.0.1/kc-groupid-mapper-1.0.0.jar"
+      - "-o"
+      - "/data/kc-groupid-mapper-1.0.0.jar"
+    volumes:
+      - ./keycloak/providers:/data:z
+    restart: on-failure
+
+  keycloak-optimce-theme:
+    profiles: ["init"]
+    image: alpine:3.20
+    entrypoint: /bin/sh
+    working_dir: /data
+    volumes:
+      - ./keycloak/providers:/data:z
+    command:
+      - "-c"
+      - |
+        set -eu
+        apk add --no-cache curl unzip zip >/dev/null
+        WORK=$$(mktemp -d)
+        JAR=/data/keycloak-theme-for-kc-all-other-versions.jar
+        curl -fsSL \
+          https://github.com/OptimCE/optimce-keycloak-theme/releases/download/v0.0.2/keycloak-theme-for-kc-all-other-versions.jar \
+          -o "$$WORK/src.jar"
+        mkdir -p "$$WORK/unpacked"
+        cd "$$WORK/unpacked"
+        unzip -o "$$WORK/src.jar" >/dev/null
+        if [ -d theme/keycloakify-starter ] && [ ! -d theme/optimce ]; then
+          mv theme/keycloakify-starter theme/optimce
+        fi
+        mkdir -p META-INF
+        echo '{"themes":[{"name":"optimce","types":["login"]}]}' > META-INF/keycloak-themes.json
+        rm -f "$$JAR"
+        zip -r "$$JAR" META-INF theme >/dev/null
+        rm -rf "$$WORK"
+    restart: on-failure
   # ============================================
   # BACKEND PROFILE - Databases and runtime
   # ============================================
@@ -123,7 +165,7 @@ services:
 
   keycloak:
     profiles: ["backend"]
-    image: ghcr.io/optimce/kc-groupid-mapper:main
+    image: quay.io/keycloak/keycloak:26.5.5@sha256:a7b0cb7a43a1235a61872883414d3f1d9a3ceac9df6e5907bd12202778a6265c
     restart: unless-stopped
     command:
       - "start"
@@ -146,6 +188,7 @@ services:
       - KC_METRICS_ENABLED=true
     volumes:
       - ./keycloak/realm/prod-config.json:/opt/keycloak/data/import/prod-config.json
+      - ./keycloak/providers:/opt/keycloak/providers/
     networks:
       - keycloak
       - api-gateway
@@ -153,6 +196,8 @@ services:
     depends_on:
       keycloak-db:
         condition: service_healthy
+
+
 
   keycloak-healthcheck:
     profiles: ["backend"]
