@@ -323,6 +323,21 @@ services:
         condition: service_started
 
   # ============================================
+  # MIGRATION PROFILE - CRM schema migrations
+  # ============================================
+  optimce-migrator:
+    profiles: ["migration"]
+    image: ghcr.io/optimce/migrator:main
+    restart: "no"
+    environment:
+      - OPTIMCE_CRM_DATABASE_URL=postgresql+asyncpg://postgres:${CRM_DB_PASSWORD}@crm-database:5432/crm_db
+    networks:
+      - crm
+    depends_on:
+      crm-database:
+        condition: service_healthy
+
+  # ============================================
   # FRONTEND PROFILE - Web serving
   # ============================================
   reverse-proxy:
