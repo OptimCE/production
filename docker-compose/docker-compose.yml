@@ -14,6 +14,18 @@ services:
       - ./krakend_config:/data:z
     restart: on-failure
 
+  generation-doc-gen:
+    profiles: ["init"]
+    image: alpine/curl:latest
+    command:
+      - "-fL"
+      - "https://optimce.github.io/allocation-key-generation/swagger.yml"
+      - "-o"
+      - "/data/generation.json"
+    volumes:
+      - ./krakend_config:/data:z
+    restart: on-failure
+
   krakend-config:
     profiles: ["init"]
     image: ghcr.io/optimce/swagger2krakend:main
@@ -28,6 +40,8 @@ services:
     restart: on-failure
     depends_on:
       swagger-doc-gen:
+        condition: service_completed_successfully
+      generation-doc-gen:
         condition: service_completed_successfully
 
   keycloak-config:
@@ -97,7 +111,7 @@ services:
         WORK=$$(mktemp -d)
         JAR=/data/keycloak-theme-for-kc-all-other-versions.jar
         curl -fsSL \
-          https://github.com/OptimCE/optimce-keycloak-theme/releases/download/v0.0.2/keycloak-theme-for-kc-all-other-versions.jar \
+          https://github.com/OptimCE/optimce-keycloak-theme/releases/download/v0.0.3/keycloak-theme-for-kc-all-other-versions.jar \
           -o "$$WORK/src.jar"
         mkdir -p "$$WORK/unpacked"
         cd "$$WORK/unpacked"
@@ -162,6 +176,51 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+
+  allocation-key-db:
+    profiles: ["backend"]
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_DB=allocation_key_local
+      - POSTGRES_PASSWORD=${ALLOCATION_KEY_DB_PASSWORD}
+      - PGDATA=/var/lib/postgresql/data
+    volumes:
+      - allocation_key_db_data:/var/lib/postgresql/data
+      - ./allocation-key-db/docker-entrypoint-initdb.d:/docker-entrypoint-initdb.d
+    networks:
+      - allocation-key
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB -h localhost || exit 1",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  nats:
+    profiles: ["backend"]
+    image: nats:2.10-alpine
+    restart: unless-stopped
+    command: ["-js", "-m", "8222", "-sd", "/data"]
+    volumes:
+      - nats_data:/data
+    networks:
+      - nats
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -q -O - 'http://localhost:8222/healthz?js-enabled-only=true' || exit 1",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
   keycloak:
     profiles: ["backend"]
@@ -271,6 +330,8 @@ services:
     depends_on:
       crm-backend:
         condition: service_started
+      allocation-key-generation:
+        condition: service_started
       keycloak:
         condition: service_started
 
@@ -318,6 +379,77 @@ services:
       crm-database:
         condition: service_healthy
       keycloak-healthcheck:
+        condition: service_healthy
+      minio:
+        condition: service_started
+
+  allocation-key-generation:
+    profiles: ["backend"]
+    image: ghcr.io/optimce/allocation-key-generation:main-prod
+    restart: unless-stopped
+    environment:
+      - ENV=production
+      - CRM_DATABASE_URL=postgresql+asyncpg://postgres:${CRM_DB_PASSWORD}@crm-database:5432/crm_db
+      - LOCAL_DATABASE_URL=postgresql+asyncpg://postgres:${ALLOCATION_KEY_DB_PASSWORD}@allocation-key-db:5432/allocation_key_local
+      - NATS_URL=nats://nats:4222
+      - ALLOW_ORIGIN=${APP_CORS_ALLOWED_ORIGIN}
+      - STORAGE_ENDPOINT=http://minio:9000
+      - STORAGE_BUCKET=${STORAGE_BUCKET}
+      - STORAGE_ACCESS_KEY=${MINIO_ROOT_USER}
+      - STORAGE_SECRET_KEY=${MINIO_ROOT_PASSWORD}
+      - STORAGE_REGION=us-east-1
+      - LOGGING_TOKEN=${LOGGING_TOKEN}
+      - LOGGING_TRACES_URL=${LOGGING_TRACES_URL}
+      - LOGGING_LOGS_URL=${LOGGING_LOGS_URL}
+      - LOGGING_METRICS_URL=${LOGGING_METRICS_URL}
+    networks:
+      - api-gateway
+      - crm
+      - allocation-key
+      - nats
+      - minio
+      - opentelemetry
+    depends_on:
+      crm-database:
+        condition: service_healthy
+      allocation-key-db:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      minio:
+        condition: service_started
+
+  allocation-key-generation-worker:
+    profiles: ["backend"]
+    image: ghcr.io/optimce/allocation-key-generation:main-worker
+    restart: unless-stopped
+    environment:
+      - ENV=production
+      - CRM_DATABASE_URL=postgresql+asyncpg://postgres:${CRM_DB_PASSWORD}@crm-database:5432/crm_db
+      - LOCAL_DATABASE_URL=postgresql+asyncpg://postgres:${ALLOCATION_KEY_DB_PASSWORD}@allocation-key-db:5432/allocation_key_local
+      - NATS_URL=nats://nats:4222
+      - ALLOW_ORIGIN=${APP_CORS_ALLOWED_ORIGIN}
+      - STORAGE_ENDPOINT=http://minio:9000
+      - STORAGE_BUCKET=${STORAGE_BUCKET}
+      - STORAGE_ACCESS_KEY=${MINIO_ROOT_USER}
+      - STORAGE_SECRET_KEY=${MINIO_ROOT_PASSWORD}
+      - STORAGE_REGION=us-east-1
+      - LOGGING_TOKEN=${LOGGING_TOKEN}
+      - LOGGING_TRACES_URL=${LOGGING_TRACES_URL}
+      - LOGGING_LOGS_URL=${LOGGING_LOGS_URL}
+      - LOGGING_METRICS_URL=${LOGGING_METRICS_URL}
+    networks:
+      - crm
+      - allocation-key
+      - nats
+      - minio
+      - opentelemetry
+    depends_on:
+      crm-database:
+        condition: service_healthy
+      allocation-key-db:
+        condition: service_healthy
+      nats:
         condition: service_healthy
       minio:
         condition: service_started
@@ -406,10 +538,26 @@ services:
     networks:
       - keycloak
 
+  allocation-key-db-backup:
+    profiles: ["backup"]
+    image: postgres:18-alpine
+    volumes:
+      - ./backups:/backups
+    environment:
+      - PGPASSWORD=${ALLOCATION_KEY_DB_PASSWORD}
+    command: >
+      sh -c '
+        pg_dump -h allocation-key-db -U postgres -d allocation_key_local -f /backups/allocation_key_$(date +%Y%m%d_%H%M%S).sql ;
+      '
+    networks:
+      - allocation-key
+
 volumes:
   crm_db_data:
   keycloak_db_data:
+  allocation_key_db_data:
   minio_data:
+  nats_data:
   krakend_config:
   keycloak_data:
 
@@ -418,5 +566,7 @@ networks:
   api-gateway:
   crm:
   keycloak:
+  allocation-key:
+  nats:
   minio:
   opentelemetry:
