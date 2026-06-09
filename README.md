@@ -26,6 +26,8 @@ Docker-based microservices infrastructure for a Customer Relationship Management
 | crm-frontend | React UI | http://localhost |
 | crm-backend | Node.js API | http://localhost/api |
 | crm-database | PostgreSQL | internal |
+| allocation-key-generation | Allocation-key generation API + worker (+ DB) | http://localhost/api/generation |
+| simulation-key | Allocation-key simulation API + worker (+ DB) | http://localhost/api/simulation |
 | keycloak | IAM/OIDC | http://localhost/keycloak |
 | krakend | API Gateway | http://localhost/api |
 | minio | S3-compatible storage | internal |
@@ -46,10 +48,10 @@ Docker Compose profiles control which services start:
 
 | Profile | Services | Purpose |
 |---------|----------|---------|
-| `backend` | crm-database, keycloak, crm-backend, minio, krakend | Core infrastructure |
+| `backend` | crm-database, keycloak, crm-backend, allocation-key-generation, simulation-key, nats, minio, krakend | Core infrastructure |
 | `frontend` | reverse-proxy, crm-frontend | Web serving layer |
-| `init` | keycloak-config, swagger-doc-gen, krakend-config, crm-frontend-config | One-shot config generators |
-| `backup` | crm-database-backup, keycloak-db-backup | Database backup services |
+| `init` | keycloak-config, swagger-doc-gen, generation-doc-gen, simulation-doc-gen, krakend-config, crm-frontend-config | One-shot config generators |
+| `backup` | crm-database-backup, keycloak-db-backup, allocation-key-db-backup, simulation-key-db-backup | Database backup services |
 
 Default startup uses `backend` + `frontend` profiles.
 
@@ -64,6 +66,8 @@ Manual backup:
 ```bash
 docker compose -f docker-compose/docker-compose.yml --profile backup run --rm crm-database-backup
 docker compose -f docker-compose/docker-compose.yml --profile backup run --rm keycloak-db-backup
+docker compose -f docker-compose/docker-compose.yml --profile backup run --rm allocation-key-db-backup
+docker compose -f docker-compose/docker-compose.yml --profile backup run --rm simulation-key-db-backup
 ```
 
 Backups are stored in `docker-compose/backups/`.

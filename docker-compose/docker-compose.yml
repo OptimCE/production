@@ -26,6 +26,18 @@ services:
       - ./krakend_config:/data:z
     restart: on-failure
 
+  simulation-doc-gen:
+    profiles: ["init"]
+    image: alpine/curl:latest
+    command:
+      - "-fL"
+      - "https://optimce.github.io/allocation-key-simulation/swagger.yml"
+      - "-o"
+      - "/data/simulation.json"
+    volumes:
+      - ./krakend_config:/data:z
+    restart: on-failure
+
   krakend-config:
     profiles: ["init"]
     image: ghcr.io/optimce/swagger2krakend:main
@@ -42,6 +54,8 @@ services:
       swagger-doc-gen:
         condition: service_completed_successfully
       generation-doc-gen:
+        condition: service_completed_successfully
+      simulation-doc-gen:
         condition: service_completed_successfully
 
   keycloak-config:
@@ -202,6 +216,31 @@ services:
       retries: 5
       start_period: 30s
 
+  simulation-key-db:
+    profiles: ["backend"]
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_DB=simulation_key_local
+      - POSTGRES_PASSWORD=${SIMULATION_KEY_DB_PASSWORD}
+      - PGDATA=/var/lib/postgresql/data
+    volumes:
+      - simulation_key_db_data:/var/lib/postgresql/data
+      - ./simulation-key-db/docker-entrypoint-initdb.d:/docker-entrypoint-initdb.d
+    networks:
+      - simulation-key
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB -h localhost || exit 1",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
   nats:
     profiles: ["backend"]
     image: nats:2.10-alpine
@@ -332,6 +371,8 @@ services:
         condition: service_started
       allocation-key-generation:
         condition: service_started
+      simulation-key:
+        condition: service_started
       keycloak:
         condition: service_started
 
@@ -454,6 +495,77 @@ services:
       minio:
         condition: service_started
 
+  simulation-key:
+    profiles: ["backend"]
+    image: ghcr.io/optimce/allocation-key-simulation:main-prod
+    restart: unless-stopped
+    environment:
+      - ENV=production
+      - CRM_DATABASE_URL=postgresql+asyncpg://postgres:${CRM_DB_PASSWORD}@crm-database:5432/crm_db
+      - LOCAL_DATABASE_URL=postgresql+asyncpg://postgres:${SIMULATION_KEY_DB_PASSWORD}@simulation-key-db:5432/simulation_key_local
+      - NATS_URL=nats://nats:4222
+      - ALLOW_ORIGIN=${APP_CORS_ALLOWED_ORIGIN}
+      - STORAGE_ENDPOINT=http://minio:9000
+      - STORAGE_BUCKET=${STORAGE_BUCKET}
+      - STORAGE_ACCESS_KEY=${MINIO_ROOT_USER}
+      - STORAGE_SECRET_KEY=${MINIO_ROOT_PASSWORD}
+      - STORAGE_REGION=us-east-1
+      - LOGGING_TOKEN=${LOGGING_TOKEN}
+      - LOGGING_TRACES_URL=${LOGGING_TRACES_URL}
+      - LOGGING_LOGS_URL=${LOGGING_LOGS_URL}
+      - LOGGING_METRICS_URL=${LOGGING_METRICS_URL}
+    networks:
+      - api-gateway
+      - crm
+      - simulation-key
+      - nats
+      - minio
+      - opentelemetry
+    depends_on:
+      crm-database:
+        condition: service_healthy
+      simulation-key-db:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      minio:
+        condition: service_started
+
+  simulation-key-worker:
+    profiles: ["backend"]
+    image: ghcr.io/optimce/allocation-key-simulation:main-worker
+    restart: unless-stopped
+    environment:
+      - ENV=production
+      - CRM_DATABASE_URL=postgresql+asyncpg://postgres:${CRM_DB_PASSWORD}@crm-database:5432/crm_db
+      - LOCAL_DATABASE_URL=postgresql+asyncpg://postgres:${SIMULATION_KEY_DB_PASSWORD}@simulation-key-db:5432/simulation_key_local
+      - NATS_URL=nats://nats:4222
+      - ALLOW_ORIGIN=${APP_CORS_ALLOWED_ORIGIN}
+      - STORAGE_ENDPOINT=http://minio:9000
+      - STORAGE_BUCKET=${STORAGE_BUCKET}
+      - STORAGE_ACCESS_KEY=${MINIO_ROOT_USER}
+      - STORAGE_SECRET_KEY=${MINIO_ROOT_PASSWORD}
+      - STORAGE_REGION=us-east-1
+      - LOGGING_TOKEN=${LOGGING_TOKEN}
+      - LOGGING_TRACES_URL=${LOGGING_TRACES_URL}
+      - LOGGING_LOGS_URL=${LOGGING_LOGS_URL}
+      - LOGGING_METRICS_URL=${LOGGING_METRICS_URL}
+    networks:
+      - crm
+      - simulation-key
+      - nats
+      - minio
+      - opentelemetry
+    depends_on:
+      crm-database:
+        condition: service_healthy
+      simulation-key-db:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      minio:
+        condition: service_started
+
   # ============================================
   # MIGRATION PROFILE - CRM schema migrations
   # ============================================
@@ -552,10 +664,25 @@ services:
     networks:
       - allocation-key
 
+  simulation-key-db-backup:
+    profiles: ["backup"]
+    image: postgres:18-alpine
+    volumes:
+      - ./backups:/backups
+    environment:
+      - PGPASSWORD=${SIMULATION_KEY_DB_PASSWORD}
+    command: >
+      sh -c '
+        pg_dump -h simulation-key-db -U postgres -d simulation_key_local -f /backups/simulation_key_$(date +%Y%m%d_%H%M%S).sql ;
+      '
+    networks:
+      - simulation-key
+
 volumes:
   crm_db_data:
   keycloak_db_data:
   allocation_key_db_data:
+  simulation_key_db_data:
   minio_data:
   nats_data:
   krakend_config:
@@ -567,6 +694,7 @@ networks:
   crm:
   keycloak:
   allocation-key:
+  simulation-key:
   nats:
   minio:
   opentelemetry:
