@@ -464,6 +464,7 @@ services:
     profiles: ["backend"]
     image: ghcr.io/optimce/allocation-key-generation:main-worker
     restart: unless-stopped
+    cpus: "2.0"
     environment:
       - ENV=production
       - CRM_DATABASE_URL=postgresql+asyncpg://postgres:${CRM_DB_PASSWORD}@crm-database:5432/crm_db
@@ -479,6 +480,9 @@ services:
       - LOGGING_TRACES_URL=${LOGGING_TRACES_URL}
       - LOGGING_LOGS_URL=${LOGGING_LOGS_URL}
       - LOGGING_METRICS_URL=${LOGGING_METRICS_URL}
+      - OMP_NUM_THREADS=1
+      - OPENBLAS_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
     networks:
       - crm
       - allocation-key
@@ -535,6 +539,7 @@ services:
     profiles: ["backend"]
     image: ghcr.io/optimce/allocation-key-simulation:main-worker
     restart: unless-stopped
+    cpus: "2.0"
     environment:
       - ENV=production
       - CRM_DATABASE_URL=postgresql+asyncpg://postgres:${CRM_DB_PASSWORD}@crm-database:5432/crm_db
@@ -550,6 +555,9 @@ services:
       - LOGGING_TRACES_URL=${LOGGING_TRACES_URL}
       - LOGGING_LOGS_URL=${LOGGING_LOGS_URL}
       - LOGGING_METRICS_URL=${LOGGING_METRICS_URL}
+      - OMP_NUM_THREADS=1
+      - OPENBLAS_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
     networks:
       - crm
       - simulation-key
