@@ -38,6 +38,18 @@ services:
       - ./krakend_config:/data:z
     restart: on-failure
 
+  news-board-doc-gen:
+    profiles: ["init"]
+    image: alpine/curl:latest
+    command:
+      - "-fL"
+      - "https://optimce.github.io/news-board/swagger.yml"
+      - "-o"
+      - "/data/news-board.json"
+    volumes:
+      - ./krakend_config:/data:z
+    restart: on-failure
+
   krakend-config:
     profiles: ["init"]
     image: ghcr.io/optimce/swagger2krakend:main
@@ -56,6 +68,8 @@ services:
       generation-doc-gen:
         condition: service_completed_successfully
       simulation-doc-gen:
+        condition: service_completed_successfully
+      news-board-doc-gen:
         condition: service_completed_successfully
 
   keycloak-config:
@@ -241,6 +255,31 @@ services:
       retries: 5
       start_period: 30s
 
+  news-board-db:
+    profiles: ["backend"]
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_DB=news_board_local
+      - POSTGRES_PASSWORD=${NEWS_BOARD_DB_PASSWORD}
+      - PGDATA=/var/lib/postgresql/data
+    volumes:
+      - news_board_db_data:/var/lib/postgresql/data
+      - ./news-board-db/docker-entrypoint-initdb.d:/docker-entrypoint-initdb.d
+    networks:
+      - news-board
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB -h localhost || exit 1",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
   nats:
     profiles: ["backend"]
     image: nats:2.10-alpine
@@ -372,6 +411,8 @@ services:
       allocation-key-generation:
         condition: service_started
       simulation-key:
+        condition: service_started
+      news-board:
         condition: service_started
       keycloak:
         condition: service_started
@@ -574,6 +615,30 @@ services:
       minio:
         condition: service_started
 
+  news-board:
+    profiles: ["backend"]
+    image: ghcr.io/optimce/news-board:main-prod
+    restart: unless-stopped
+    environment:
+      - ENV=production
+      - CRM_DATABASE_URL=postgresql+asyncpg://postgres:${CRM_DB_PASSWORD}@crm-database:5432/crm_db
+      - LOCAL_DATABASE_URL=postgresql+asyncpg://postgres:${NEWS_BOARD_DB_PASSWORD}@news-board-db:5432/news_board_local
+      - ALLOW_ORIGIN=${APP_CORS_ALLOWED_ORIGIN}
+      - LOGGING_TOKEN=${LOGGING_TOKEN}
+      - LOGGING_TRACES_URL=${LOGGING_TRACES_URL}
+      - LOGGING_LOGS_URL=${LOGGING_LOGS_URL}
+      - LOGGING_METRICS_URL=${LOGGING_METRICS_URL}
+    networks:
+      - api-gateway
+      - crm
+      - news-board
+      - opentelemetry
+    depends_on:
+      crm-database:
+        condition: service_healthy
+      news-board-db:
+        condition: service_healthy
+
   # ============================================
   # MIGRATION PROFILE - CRM schema migrations
   # ============================================
@@ -686,11 +751,26 @@ services:
     networks:
       - simulation-key
 
+  news-board-db-backup:
+    profiles: ["backup"]
+    image: postgres:18-alpine
+    volumes:
+      - ./backups:/backups
+    environment:
+      - PGPASSWORD=${NEWS_BOARD_DB_PASSWORD}
+    command: >
+      sh -c '
+        pg_dump -h news-board-db -U postgres -d news_board_local -f /backups/news_board_$(date +%Y%m%d_%H%M%S).sql ;
+      '
+    networks:
+      - news-board
+
 volumes:
   crm_db_data:
   keycloak_db_data:
   allocation_key_db_data:
   simulation_key_db_data:
+  news_board_db_data:
   minio_data:
   nats_data:
   krakend_config:
@@ -703,6 +783,7 @@ networks:
   keycloak:
   allocation-key:
   simulation-key:
+  news-board:
   nats:
   minio:
   opentelemetry:
