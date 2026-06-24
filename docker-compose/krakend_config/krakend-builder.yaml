@@ -11,6 +11,6 @@ services:
   simulation:
     swagger: /config/simulation.json
     host: simulation-key:8000
-  news-board:
+  news:
     swagger: /config/news-board.json
     host: news-board:8000
