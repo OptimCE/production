@@ -50,6 +50,18 @@ services:
       - ./krakend_config:/data:z
     restart: on-failure
 
+  billing-doc-gen:
+    profiles: ["init"]
+    image: alpine/curl:latest
+    command:
+      - "-fL"
+      - "https://optimce.github.io/billing/swagger.yml"
+      - "-o"
+      - "/data/billing.json"
+    volumes:
+      - ./krakend_config:/data:z
+    restart: on-failure
+
   krakend-config:
     profiles: ["init"]
     image: ghcr.io/optimce/swagger2krakend:main
@@ -70,6 +82,8 @@ services:
       simulation-doc-gen:
         condition: service_completed_successfully
       news-board-doc-gen:
+        condition: service_completed_successfully
+      billing-doc-gen:
         condition: service_completed_successfully
 
   keycloak-config:
@@ -280,6 +294,31 @@ services:
       retries: 5
       start_period: 30s
 
+  billing-db:
+    profiles: ["backend"]
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_DB=billing_local
+      - POSTGRES_PASSWORD=${BILLING_DB_PASSWORD}
+      - PGDATA=/var/lib/postgresql/data
+    volumes:
+      - billing_db_data:/var/lib/postgresql/data
+      - ./billing-db/docker-entrypoint-initdb.d:/docker-entrypoint-initdb.d
+    networks:
+      - billing
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB -h localhost || exit 1",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
   nats:
     profiles: ["backend"]
     image: nats:2.10-alpine
@@ -387,13 +426,20 @@ services:
       - MINIO_ROOT_USER=${MINIO_ROOT_USER}
       - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
       - STORAGE_BUCKET=${STORAGE_BUCKET}
+      - TEMPLATES_BUCKET=${TEMPLATES_BUCKET}
+      - OUTPUT_BUCKET=${OUTPUT_BUCKET}
     entrypoint: >
       /bin/sh -c "
       sleep 5;
       mc alias set local http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD};
       mc mb --ignore-existing local/$${STORAGE_BUCKET};
+      mc mb --ignore-existing local/$${TEMPLATES_BUCKET};
+      mc mb --ignore-existing local/$${OUTPUT_BUCKET};
+      mc cp --recursive /templates/billing local/$${TEMPLATES_BUCKET}/;
       exit 0;
       "
+    volumes:
+      - ./document-templates:/templates:ro
     networks:
       - minio
 
@@ -413,6 +459,8 @@ services:
       simulation-key:
         condition: service_started
       news-board:
+        condition: service_started
+      billing:
         condition: service_started
       keycloak:
         condition: service_started
@@ -451,6 +499,11 @@ services:
       - DB_USERNAME=postgres
       - DB_PASSWORD=${CRM_DB_PASSWORD}
       - DB_NAME=crm_db
+      # Shared regulator registry. crm-backend fails fast (process.exit(1)) if this
+      # path is unset or unreadable, so the mount below is mandatory.
+      - REGULATORS_CONFIG_PATH=/app/reference/regulators.json
+    volumes:
+      - ./reference:/app/reference:ro
     networks:
       - api-gateway
       - crm
@@ -639,6 +692,128 @@ services:
       news-board-db:
         condition: service_healthy
 
+  # Stateless PDF renderer. Owns the DOCGEN_REQUESTS / DOCGEN_RESULTS / DOCGEN_DLQ
+  # JetStream streams. Do NOT set any DOCGEN_* variable here: this service calls
+  # add_stream() without a drift reconcile, so a stream that already exists with a
+  # different subject/retention makes it boot-loop with an opaque JetStream error.
+  document-generation:
+    profiles: ["backend"]
+    image: ghcr.io/optimce/document-generation:main-worker
+    restart: unless-stopped
+    environment:
+      - ENV=production
+      - NATS_URL=nats://nats:4222
+      - STORAGE_ENDPOINT=http://minio:9000
+      - TEMPLATES_BUCKET=${TEMPLATES_BUCKET}
+      - OUTPUT_BUCKET=${OUTPUT_BUCKET}
+      - STORAGE_ACCESS_KEY=${MINIO_ROOT_USER}
+      - STORAGE_SECRET_KEY=${MINIO_ROOT_PASSWORD}
+      - STORAGE_REGION=us-east-1
+      - LOGGING_TOKEN=${LOGGING_TOKEN}
+      - LOGGING_TRACES_URL=${LOGGING_TRACES_URL}
+      - LOGGING_LOGS_URL=${LOGGING_LOGS_URL}
+      - LOGGING_METRICS_URL=${LOGGING_METRICS_URL}
+    networks:
+      - nats
+      - minio
+      - opentelemetry
+    depends_on:
+      nats:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+
+  billing:
+    profiles: ["backend"]
+    image: ghcr.io/optimce/billing:main-prod
+    restart: unless-stopped
+    environment:
+      - ENV=production
+      - CRM_DATABASE_URL=postgresql+asyncpg://postgres:${CRM_DB_PASSWORD}@crm-database:5432/crm_db
+      - LOCAL_DATABASE_URL=postgresql+asyncpg://postgres:${BILLING_DB_PASSWORD}@billing-db:5432/billing_local
+      - NATS_URL=nats://nats:4222
+      - ALLOW_ORIGIN=${APP_CORS_ALLOWED_ORIGIN}
+      - STORAGE_ENDPOINT=http://minio:9000
+      - STORAGE_BUCKET=${STORAGE_BUCKET}
+      - TEMPLATES_BUCKET=${TEMPLATES_BUCKET}
+      - OUTPUT_BUCKET=${OUTPUT_BUCKET}
+      - STORAGE_ACCESS_KEY=${MINIO_ROOT_USER}
+      - STORAGE_SECRET_KEY=${MINIO_ROOT_PASSWORD}
+      - STORAGE_REGION=us-east-1
+      # Startup asserts parity between the active regulators here and the billing
+      # regimes bundled in the image; a missing file crashes the container.
+      - REGULATORS_CONFIG_PATH=/app/reference/regulators.json
+      - DEFAULT_LOCALE=fr-BE
+      - LOGGING_TOKEN=${LOGGING_TOKEN}
+      - LOGGING_TRACES_URL=${LOGGING_TRACES_URL}
+      - LOGGING_LOGS_URL=${LOGGING_LOGS_URL}
+      - LOGGING_METRICS_URL=${LOGGING_METRICS_URL}
+    volumes:
+      - ./reference:/app/reference:ro
+    networks:
+      - api-gateway
+      - crm
+      - billing
+      - nats
+      - minio
+      - opentelemetry
+    depends_on:
+      crm-database:
+        condition: service_healthy
+      billing-db:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+
+  billing-worker:
+    profiles: ["backend"]
+    image: ghcr.io/optimce/billing:main-worker
+    restart: unless-stopped
+    environment:
+      - ENV=production
+      - CRM_DATABASE_URL=postgresql+asyncpg://postgres:${CRM_DB_PASSWORD}@crm-database:5432/crm_db
+      - LOCAL_DATABASE_URL=postgresql+asyncpg://postgres:${BILLING_DB_PASSWORD}@billing-db:5432/billing_local
+      - NATS_URL=nats://nats:4222
+      - ALLOW_ORIGIN=${APP_CORS_ALLOWED_ORIGIN}
+      - STORAGE_ENDPOINT=http://minio:9000
+      - STORAGE_BUCKET=${STORAGE_BUCKET}
+      - TEMPLATES_BUCKET=${TEMPLATES_BUCKET}
+      - OUTPUT_BUCKET=${OUTPUT_BUCKET}
+      - STORAGE_ACCESS_KEY=${MINIO_ROOT_USER}
+      - STORAGE_SECRET_KEY=${MINIO_ROOT_PASSWORD}
+      - STORAGE_REGION=us-east-1
+      - REGULATORS_CONFIG_PATH=/app/reference/regulators.json
+      - DEFAULT_LOCALE=fr-BE
+      - LOGGING_TOKEN=${LOGGING_TOKEN}
+      - LOGGING_TRACES_URL=${LOGGING_TRACES_URL}
+      - LOGGING_LOGS_URL=${LOGGING_LOGS_URL}
+      - LOGGING_METRICS_URL=${LOGGING_METRICS_URL}
+    volumes:
+      - ./reference:/app/reference:ro
+    networks:
+      - crm
+      - billing
+      - nats
+      - minio
+      - opentelemetry
+    depends_on:
+      crm-database:
+        condition: service_healthy
+      billing-db:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      # Start docgen first so its DOCGEN_RESULTS stream usually exists before we
+      # subscribe. The background subscribe-retry in worker/dispatcher.py is the
+      # real guarantee, but it gives up after ~20 min and then silently disables
+      # PDF attach for the lifetime of the process.
+      document-generation:
+        condition: service_started
+
   # ============================================
   # MIGRATION PROFILE - CRM schema migrations
   # ============================================
@@ -765,12 +940,27 @@ services:
     networks:
       - news-board
 
+  billing-db-backup:
+    profiles: ["backup"]
+    image: postgres:18-alpine
+    volumes:
+      - ./backups:/backups
+    environment:
+      - PGPASSWORD=${BILLING_DB_PASSWORD}
+    command: >
+      sh -c '
+        pg_dump -h billing-db -U postgres -d billing_local -f /backups/billing_$(date +%Y%m%d_%H%M%S).sql ;
+      '
+    networks:
+      - billing
+
 volumes:
   crm_db_data:
   keycloak_db_data:
   allocation_key_db_data:
   simulation_key_db_data:
   news_board_db_data:
+  billing_db_data:
   minio_data:
   nats_data:
   krakend_config:
@@ -784,6 +974,7 @@ networks:
   allocation-key:
   simulation-key:
   news-board:
+  billing:
   nats:
   minio:
   opentelemetry:

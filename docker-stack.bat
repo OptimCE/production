@@ -121,15 +121,12 @@ call :do_backup
 exit /b %errorlevel%
 
 :do_backup
-echo Backing up CRM database...
-%DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" --profile backup run --rm crm-database-backup
-if errorlevel 1 (
-    echo CRM backup failed
-)
-echo Backing up Keycloak database...
-%DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" --profile backup run --rm keycloak-db-backup
-if errorlevel 1 (
-    echo Keycloak backup failed
+rem One entry per database in the backup profile. A failure is reported but does not
+rem abort the remaining dumps, so one broken annex cannot block the shutdown.
+for %%J in (crm-database-backup keycloak-db-backup allocation-key-db-backup simulation-key-db-backup news-board-db-backup billing-db-backup) do (
+    echo Running %%J...
+    %DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" --profile backup run --rm %%J
+    if errorlevel 1 echo %%J failed
 )
 echo Backups completed.
 exit /b 0

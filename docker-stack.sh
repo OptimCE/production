@@ -80,10 +80,14 @@ stop_stack() {
 }
 
 do_backup() {
-    echo "Backing up CRM database..."
-    compose -f "$COMPOSE_FILE" --profile backup --env-file "$ENV_FILE" run --rm crm-database-backup || echo "CRM backup failed"
-    echo "Backing up Keycloak database..."
-    compose -f "$COMPOSE_FILE" --profile backup --env-file "$ENV_FILE" run --rm keycloak-db-backup|| echo "Keycloak backup failed"
+    # One entry per database in the backup profile. A failure is reported but does
+    # not abort the remaining dumps, so one broken annex cannot block the shutdown.
+    local jobs="crm-database-backup keycloak-db-backup allocation-key-db-backup simulation-key-db-backup news-board-db-backup billing-db-backup"
+
+    for job in $jobs; do
+        echo "Running ${job}..."
+        compose -f "$COMPOSE_FILE" --profile backup --env-file "$ENV_FILE" run --rm "$job" || echo "${job} failed"
+    done
     echo "Backups completed."
 }
 
