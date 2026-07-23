@@ -121,14 +121,29 @@ call :do_backup
 exit /b %errorlevel%
 
 :do_backup
-rem One entry per database in the backup profile. A failure is reported but does not
-rem abort the remaining dumps, so one broken annex cannot block the shutdown.
+rem Run every dump, but do not upload or delete anything if one dump fails.
+set "BACKUP_FAILED=0"
 for %%J in (crm-database-backup keycloak-db-backup allocation-key-db-backup simulation-key-db-backup news-board-db-backup billing-db-backup) do (
     echo Running %%J...
     %DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" --profile backup run --rm %%J
-    if errorlevel 1 echo %%J failed
+    if errorlevel 1 (
+        echo %%J failed
+        set "BACKUP_FAILED=1"
+    )
 )
-echo Backups completed.
+
+if "%BACKUP_FAILED%"=="1" (
+    echo At least one backup failed; local files were retained.
+    exit /b 1
+)
+
+echo Uploading and verifying backups...
+%DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" --profile backup run --rm backup-upload
+if errorlevel 1 (
+    echo Backup upload or verification failed; local files were retained.
+    exit /b 1
+)
+echo Backups uploaded, verified, and removed locally.
 exit /b 0
 
 :parse_start_options

@@ -879,7 +879,12 @@ services:
       - PGPASSWORD=${CRM_DB_PASSWORD}
     command: >
       sh -c '
-        pg_dump -h crm-database -U postgres -d crm_db -f /backups/crm_db_$(date +%Y%m%d_%H%M%S).sql ;
+        timestamp=$$(date +%Y%m%d_%H%M%S);
+        tmp=/backups/crm_db_$${timestamp}.sql.tmp;
+        output=/backups/crm_db_$${timestamp}.sql;
+        trap "rm -f \"$$tmp\"" EXIT;
+        pg_dump -h crm-database -U postgres -d crm_db -f "$$tmp";
+        mv "$$tmp" "$$output";
       '
     networks:
       - crm
@@ -893,7 +898,12 @@ services:
       - PGPASSWORD=${KEYCLOAK_DB_PASSWORD}
     command: >
       sh -c '
-        pg_dump -h keycloak-db -U postgres -d keycloak -f /backups/keycloak_$(date +%Y%m%d_%H%M%S).sql ;
+        timestamp=$$(date +%Y%m%d_%H%M%S);
+        tmp=/backups/keycloak_$${timestamp}.sql.tmp;
+        output=/backups/keycloak_$${timestamp}.sql;
+        trap "rm -f \"$$tmp\"" EXIT;
+        pg_dump -h keycloak-db -U postgres -d keycloak -f "$$tmp";
+        mv "$$tmp" "$$output";
       '
     networks:
       - keycloak
@@ -907,7 +917,12 @@ services:
       - PGPASSWORD=${ALLOCATION_KEY_DB_PASSWORD}
     command: >
       sh -c '
-        pg_dump -h allocation-key-db -U postgres -d allocation_key_local -f /backups/allocation_key_$(date +%Y%m%d_%H%M%S).sql ;
+        timestamp=$$(date +%Y%m%d_%H%M%S);
+        tmp=/backups/allocation_key_$${timestamp}.sql.tmp;
+        output=/backups/allocation_key_$${timestamp}.sql;
+        trap "rm -f \"$$tmp\"" EXIT;
+        pg_dump -h allocation-key-db -U postgres -d allocation_key_local -f "$$tmp";
+        mv "$$tmp" "$$output";
       '
     networks:
       - allocation-key
@@ -921,7 +936,12 @@ services:
       - PGPASSWORD=${SIMULATION_KEY_DB_PASSWORD}
     command: >
       sh -c '
-        pg_dump -h simulation-key-db -U postgres -d simulation_key_local -f /backups/simulation_key_$(date +%Y%m%d_%H%M%S).sql ;
+        timestamp=$$(date +%Y%m%d_%H%M%S);
+        tmp=/backups/simulation_key_$${timestamp}.sql.tmp;
+        output=/backups/simulation_key_$${timestamp}.sql;
+        trap "rm -f \"$$tmp\"" EXIT;
+        pg_dump -h simulation-key-db -U postgres -d simulation_key_local -f "$$tmp";
+        mv "$$tmp" "$$output";
       '
     networks:
       - simulation-key
@@ -935,7 +955,12 @@ services:
       - PGPASSWORD=${NEWS_BOARD_DB_PASSWORD}
     command: >
       sh -c '
-        pg_dump -h news-board-db -U postgres -d news_board_local -f /backups/news_board_$(date +%Y%m%d_%H%M%S).sql ;
+        timestamp=$$(date +%Y%m%d_%H%M%S);
+        tmp=/backups/news_board_$${timestamp}.sql.tmp;
+        output=/backups/news_board_$${timestamp}.sql;
+        trap "rm -f \"$$tmp\"" EXIT;
+        pg_dump -h news-board-db -U postgres -d news_board_local -f "$$tmp";
+        mv "$$tmp" "$$output";
       '
     networks:
       - news-board
@@ -949,10 +974,41 @@ services:
       - PGPASSWORD=${BILLING_DB_PASSWORD}
     command: >
       sh -c '
-        pg_dump -h billing-db -U postgres -d billing_local -f /backups/billing_$(date +%Y%m%d_%H%M%S).sql ;
+        timestamp=$$(date +%Y%m%d_%H%M%S);
+        tmp=/backups/billing_$${timestamp}.sql.tmp;
+        output=/backups/billing_$${timestamp}.sql;
+        trap "rm -f \"$$tmp\"" EXIT;
+        pg_dump -h billing-db -U postgres -d billing_local -f "$$tmp";
+        mv "$$tmp" "$$output";
       '
     networks:
       - billing
+
+  backup-upload:
+    profiles: ["backup"]
+    image: rclone/rclone:latest
+    volumes:
+      - ./backups:/backups
+    environment:
+      - RCLONE_CONFIG_BACKUP_TYPE=s3
+      - RCLONE_CONFIG_BACKUP_PROVIDER=Other
+      - RCLONE_CONFIG_BACKUP_ENDPOINT=${BACKUP_S3_ENDPOINT}
+      - RCLONE_CONFIG_BACKUP_REGION=${BACKUP_S3_REGION}
+      - RCLONE_CONFIG_BACKUP_ACCESS_KEY_ID=${BACKUP_S3_ACCESS_KEY}
+      - RCLONE_CONFIG_BACKUP_SECRET_ACCESS_KEY=${BACKUP_S3_SECRET_KEY}
+      - RCLONE_CONFIG_BACKUP_FORCE_PATH_STYLE=${BACKUP_S3_FORCE_PATH_STYLE}
+      - BACKUP_S3_BUCKET=${BACKUP_S3_BUCKET}
+      - BACKUP_S3_PREFIX=${BACKUP_S3_PREFIX}
+    command: >
+      sh -c '
+        set -eu;
+        rclone copy /backups "backup:$${BACKUP_S3_BUCKET}/$${BACKUP_S3_PREFIX}" --include "*.sql";
+        rclone check /backups "backup:$${BACKUP_S3_BUCKET}/$${BACKUP_S3_PREFIX}" --include "*.sql" --one-way;
+        for file in /backups/*.sql; do
+          [ -e "$$file" ] || continue;
+          rm -- "$$file";
+        done;
+      '
 
 volumes:
   crm_db_data:
