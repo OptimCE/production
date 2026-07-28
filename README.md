@@ -56,7 +56,7 @@ Docker Compose profiles control which services start:
 | `frontend` | reverse-proxy, crm-frontend | Web serving layer |
 | `init` | keycloak-config, swagger-doc-gen, generation-doc-gen, simulation-doc-gen, news-board-doc-gen, billing-doc-gen, krakend-config, crm-frontend-config | One-shot config generators |
 | `migration` | optimce-migrator | One-shot CRM schema migrations |
-| `backup` | crm-database-backup, keycloak-db-backup, allocation-key-db-backup, simulation-key-db-backup, news-board-db-backup, billing-db-backup | Database backup services |
+| `backup` | database backup services, backup-upload | Database dumps and S3-compatible backup upload |
 
 Default startup uses `backend` + `frontend` profiles.
 
@@ -70,7 +70,9 @@ docker compose --profile backend --profile migration run --rm optimce-migrator
 
 ## Automatic Backups
 
-Backups run automatically before `stop` or `restart`, one dump per database:
+Backups run automatically before `stop` or `restart`. Each database is dumped locally,
+uploaded to the configured external S3-compatible bucket, verified, and then removed
+from the VPS:
 - CRM → `backups/crm_db_YYYYMMDD_HHMMSS.sql`
 - Keycloak → `backups/keycloak_YYYYMMDD_HHMMSS.sql`
 - Allocation-key → `backups/allocation_key_YYYYMMDD_HHMMSS.sql`
@@ -78,8 +80,13 @@ Backups run automatically before `stop` or `restart`, one dump per database:
 - News-board → `backups/news_board_YYYYMMDD_HHMMSS.sql`
 - Billing → `backups/billing_YYYYMMDD_HHMMSS.sql`
 
-A failing dump is reported but does not abort the others or block the shutdown.
-Retention cleanup is not currently implemented; old backup files must be removed manually.
+A failing dump or upload prevents shutdown and retains the local files for retry.
+The uploader uses `rclone copy`, never `sync`, so local cleanup cannot delete remote
+backups. Remote retention must be configured through the S3 provider lifecycle rules.
+
+Configure `BACKUP_S3_*` in `docker-compose/.env`. The endpoint is provider-independent
+and supports AWS S3 and other S3-compatible services. Use a dedicated bucket or prefix
+and credentials restricted to that bucket/prefix.
 
 Manual backup:
 ```bash
@@ -89,9 +96,11 @@ docker compose -f docker-compose/docker-compose.yml --profile backup run --rm al
 docker compose -f docker-compose/docker-compose.yml --profile backup run --rm simulation-key-db-backup
 docker compose -f docker-compose/docker-compose.yml --profile backup run --rm news-board-db-backup
 docker compose -f docker-compose/docker-compose.yml --profile backup run --rm billing-db-backup
+docker compose -f docker-compose/docker-compose.yml --profile backup --env-file docker-compose/.env run --rm backup-upload
 ```
 
-Backups are stored in `docker-compose/backups/`.
+Manual database dumps must be followed by `backup-upload` to upload, verify, and clear
+`docker-compose/backups/`. Failed uploads leave the local files untouched.
 
 ## Configuration
 

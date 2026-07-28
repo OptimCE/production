@@ -16,3 +16,7 @@ docker-compose/nginx/conf.d/default.conf
 docker-compose/keycloak/providers/
 
 docker-compose/backups/
+
+
+#Ignore possible real environnement file
+docker-compose/.env

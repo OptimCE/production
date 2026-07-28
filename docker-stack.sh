@@ -80,15 +80,26 @@ stop_stack() {
 }
 
 do_backup() {
-    # One entry per database in the backup profile. A failure is reported but does
-    # not abort the remaining dumps, so one broken annex cannot block the shutdown.
+    # Run every dump, but do not upload or delete anything if one dump fails.
     local jobs="crm-database-backup keycloak-db-backup allocation-key-db-backup simulation-key-db-backup news-board-db-backup billing-db-backup"
+    local failed=0
 
     for job in $jobs; do
         echo "Running ${job}..."
-        compose -f "$COMPOSE_FILE" --profile backup --env-file "$ENV_FILE" run --rm "$job" || echo "${job} failed"
+        if ! compose -f "$COMPOSE_FILE" --profile backup --env-file "$ENV_FILE" run --rm "$job"; then
+            echo "${job} failed"
+            failed=1
+        fi
     done
-    echo "Backups completed."
+
+    if [ "$failed" -ne 0 ]; then
+        echo "At least one backup failed; local files were retained."
+        return 1
+    fi
+
+    echo "Uploading and verifying backups..."
+    compose -f "$COMPOSE_FILE" --profile backup --env-file "$ENV_FILE" run --rm backup-upload
+    echo "Backups uploaded, verified, and removed locally."
 }
 
 parse_start_options() {
