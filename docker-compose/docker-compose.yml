@@ -96,25 +96,6 @@ services:
     command:
       - < /config/prod-config.template.json > /config/prod-config.json
 
-  nginx-config:
-    profiles: ["init"]
-    image: ghcr.io/ourouk/alpine-envsubst:main
-    env_file:
-      - .env
-    volumes:
-      - ./nginx/conf-template.d:/config
-      - ./nginx/conf.d:/output
-    entrypoint: /bin/sh
-    command:
-      - "-c"
-      - |
-        if [ "${USE_HTTPS}" = "true" ]; then
-          cp /config/default-https.template.conf /tmp/template.conf;
-        else
-          cp /config/default-http.template.conf /tmp/template.conf;
-        fi
-        envsubst < /tmp/template.conf | sed 's/§/$/g' > /output/default.conf
-
   crm-frontend-config:
     profiles: ["init"]
     image: ghcr.io/ourouk/alpine-envsubst:main
@@ -369,6 +350,13 @@ services:
       - keycloak
       - api-gateway
       - reverse-proxy
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.keycloak.rule: "Host(`${DOMAIN_HOST}`) && PathPrefix(`/keycloak`)"
+      traefik.http.routers.keycloak.entrypoints: "websecure"
+      traefik.http.routers.keycloak.tls.certresolver: "letsencrypt"
+      traefik.http.routers.keycloak.service: "keycloak"
+      traefik.http.services.keycloak.loadbalancer.server.port: "8080"
     depends_on:
       keycloak-db:
         condition: service_healthy
@@ -409,6 +397,13 @@ services:
     networks:
       - reverse-proxy
       - minio
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.minio.rule: "Host(`s3.${DOMAIN_HOST}`)"
+      traefik.http.routers.minio.entrypoints: "websecure"
+      traefik.http.routers.minio.tls.certresolver: "letsencrypt"
+      traefik.http.routers.minio.service: "minio"
+      traefik.http.services.minio.loadbalancer.server.port: "9000"
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
       interval: 10s
@@ -451,6 +446,15 @@ services:
     networks:
       - api-gateway
       - reverse-proxy
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.krakend.rule: "Host(`${DOMAIN_HOST}`) && PathPrefix(`/api`)"
+      traefik.http.routers.krakend.entrypoints: "websecure"
+      traefik.http.routers.krakend.tls.certresolver: "letsencrypt"
+      traefik.http.routers.krakend.service: "krakend"
+      traefik.http.routers.krakend.middlewares: "krakend-stripprefix"
+      traefik.http.services.krakend.loadbalancer.server.port: "8080"
+      traefik.http.middlewares.krakend-stripprefix.stripprefix.prefixes: "/api"
     depends_on:
       crm-backend:
         condition: service_started
@@ -832,32 +836,35 @@ services:
   # ============================================
   # FRONTEND PROFILE - Web serving
   # ============================================
-  reverse-proxy:
-    profiles: ["frontend"]
-    image: nginx:latest
+  traefik:
+    profiles: ["frontend", "backend"]
+    image: traefik:v3
+    restart: unless-stopped
     ports:
       - "80:80"
       - "443:443"
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedByDefault=false"
+      - "--providers.docker.network=reverse-proxy"
+      - "--providers.file.directory=/etc/traefik/dynamic"
+      - "--providers.file.watch=true"
+      - "--entryPoints.web.address=:80"
+      - "--entryPoints.websecure.address=:443"
+      - "--entryPoints.websecure.http.middlewares=security-headers@file"
+      - "--entryPoints.web.http.redirections.entryPoint.to=websecure"
+      - "--entryPoints.web.http.redirections.entryPoint.scheme=https"
+      - "--certificatesResolvers.letsencrypt.acme.httpChallenge=true"
+      - "--certificatesResolvers.letsencrypt.acme.httpChallenge.entryPoint=web"
+      - "--certificatesResolvers.letsencrypt.acme.email=${SSL_EMAIL}"
+      - "--certificatesResolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
+      - "--accesslog=true"
     volumes:
-      - ./nginx/conf.d:/etc/nginx/conf.d
-      - ./nginx/certs:/etc/nginx/certs
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/letsencrypt:/letsencrypt
+      - ./traefik/dynamic:/etc/traefik/dynamic:ro
     networks:
       - reverse-proxy
-      - minio
-      - api-gateway
-      - keycloak
-      - crm
-
-  certbot:
-    profiles: ["frontend"]
-    image: certbot/certbot:latest
-    volumes:
-      - ./nginx/certs:/etc/letsencrypt
-      - ./nginx/certbot-webroot:/webroot
-    command: certonly --webroot -w /webroot -d ${DOMAIN_HOST} --agree-tos -m ${SSL_EMAIL} --non-interactive
-    environment:
-      - DOMAIN_HOST=${DOMAIN_HOST}
-      - SSL_EMAIL=${SSL_EMAIL}
 
   crm-frontend:
     profiles: ["frontend"]
@@ -866,6 +873,17 @@ services:
       - ./crm-frontend-config/config.json:/usr/share/nginx/html/assets/config/config.json
     networks:
       - reverse-proxy
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.crm-frontend.rule: "Host(`${DOMAIN_HOST}`)"
+      traefik.http.routers.crm-frontend.entrypoints: "websecure"
+      traefik.http.routers.crm-frontend.tls.certresolver: "letsencrypt"
+      traefik.http.routers.crm-frontend.service: "crm-frontend"
+      traefik.http.routers.crm-frontend.middlewares: "spa-fallback"
+      traefik.http.services.crm-frontend.loadbalancer.server.port: "80"
+      traefik.http.middlewares.spa-fallback.errors.status: "404"
+      traefik.http.middlewares.spa-fallback.errors.service: "crm-frontend"
+      traefik.http.middlewares.spa-fallback.errors.query: "/index.html"
 
   # ============================================
   # BACKUP PROFILE - Database backups
@@ -1019,8 +1037,6 @@ volumes:
   billing_db_data:
   minio_data:
   nats_data:
-  krakend_config:
-  keycloak_data:
 
 networks:
   reverse-proxy:
