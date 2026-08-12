@@ -16,3 +16,4 @@ docker-compose/nginx/conf.d/default.conf
 docker-compose/keycloak/providers/
 
 docker-compose/backups/
+.env
