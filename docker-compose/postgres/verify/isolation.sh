@@ -14,7 +14,14 @@
 # or directly:
 #
 #     docker compose -f docker-compose/docker-compose.yml --env-file docker-compose/.env \
-#       run --rm --no-deps --entrypoint /postgres/verify/isolation.sh postgres-init
+#       --profile backend run --rm --no-deps \
+#       --entrypoint sh postgres-init /postgres/verify/isolation.sh
+#
+# Invoked THROUGH sh, not as the entrypoint itself: these arrive over a bind
+# mount, so their exec bit is whatever the host filesystem reports. Docker
+# Desktop on Windows says "executable" for everything; a Linux host tells the
+# truth, and `--entrypoint /postgres/verify/isolation.sh` then fails with
+# "permission denied" before the script runs a single line.
 #
 # `keycloak` is deliberately absent from every matrix below: it lives on a
 # SEPARATE instance (compose service `keycloak-db`), so these roles cannot even

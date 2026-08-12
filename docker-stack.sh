@@ -102,18 +102,26 @@ verify_stack() {
     # MSYS_NO_PATHCONV=1 is not optional under Git Bash on Windows: it would
     # otherwise rewrite /postgres/verify/... into a C:\ path before Docker ever
     # sees it, and the container fails with `stat C:/Program: no such file`.
+    #
+    # `--entrypoint sh <script>` rather than `--entrypoint <script>`: the scripts
+    # arrive over a bind mount, so their executable bit is whatever the host
+    # filesystem says. Docker Desktop on Windows reports every bind-mounted file
+    # as executable; a Linux host reports the real mode, and git records these as
+    # 100644. Running them THROUGH sh needs no exec bit and behaves the same on
+    # both. (The bit is set in git as well, but do not rely on it alone — a
+    # checkout on a filesystem that cannot store it silently loses it.)
     local status=0
 
     echo "Proving database isolation..."
     if ! MSYS_NO_PATHCONV=1 compose -f "$COMPOSE_FILE" --profile backend --env-file "$ENV_FILE" \
-        run --rm --no-deps --entrypoint /postgres/verify/isolation.sh postgres-init; then
+        run --rm --no-deps --entrypoint sh postgres-init /postgres/verify/isolation.sh; then
         status=1
     fi
 
     echo
     echo "Proving every granted CRM write lands..."
     if ! MSYS_NO_PATHCONV=1 compose -f "$COMPOSE_FILE" --profile backend --env-file "$ENV_FILE" \
-        run --rm --no-deps --entrypoint /postgres/verify/positive-writes.sh postgres-init; then
+        run --rm --no-deps --entrypoint sh postgres-init /postgres/verify/positive-writes.sh; then
         status=1
     fi
 

@@ -145,12 +145,12 @@ rem here — unlike docker-stack.sh under Git Bash.
 set "VERIFY_STATUS=0"
 
 echo Proving database isolation...
-%DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --profile backend --env-file "%ENV_FILE%" run --rm --no-deps --entrypoint /postgres/verify/isolation.sh postgres-init
+%DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --profile backend --env-file "%ENV_FILE%" run --rm --no-deps --entrypoint sh postgres-init /postgres/verify/isolation.sh
 if errorlevel 1 set "VERIFY_STATUS=1"
 
 echo.
 echo Proving every granted CRM write lands...
-%DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --profile backend --env-file "%ENV_FILE%" run --rm --no-deps --entrypoint /postgres/verify/positive-writes.sh postgres-init
+%DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --profile backend --env-file "%ENV_FILE%" run --rm --no-deps --entrypoint sh postgres-init /postgres/verify/positive-writes.sh
 if errorlevel 1 set "VERIFY_STATUS=1"
 
 if "%VERIFY_STATUS%"=="1" (

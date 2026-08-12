@@ -16,7 +16,11 @@
 # or directly:
 #
 #     docker compose -f docker-compose/docker-compose.yml --env-file docker-compose/.env \
-#       run --rm --no-deps --entrypoint /postgres/verify/positive-writes.sh postgres-init
+#       --profile backend run --rm --no-deps \
+#       --entrypoint sh postgres-init /postgres/verify/positive-writes.sh
+#
+# Invoked THROUGH sh, not as the entrypoint itself — see the note in
+# isolation.sh: the exec bit on a bind mount is the host's, not git's.
 #
 # SAFE ON LIVE DATA. Every assertion runs inside BEGIN; ... ROLLBACK;. nextval is
 # non-transactional, so a sequence advances by one: harmless, and exactly what
