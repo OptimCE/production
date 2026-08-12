@@ -15,6 +15,7 @@ Commands:
     start      Pull images (optional) and start init, backend, then frontend
     stop       Stop init, backend, and frontend profiles
     restart    Stop then start
+    verify     Prove the database isolation and the CRM grant matrix
     help       Show this help message
 
 Options (for start/restart):
@@ -80,15 +81,49 @@ stop_stack() {
 }
 
 do_backup() {
-    # One entry per database in the backup profile. A failure is reported but does
-    # not abort the remaining dumps, so one broken annex cannot block the shutdown.
-    local jobs="crm-database-backup keycloak-db-backup allocation-key-db-backup simulation-key-db-backup news-board-db-backup billing-db-backup"
+    # Two jobs, because there are two instances. `db-backup` loops the five
+    # application databases plus the cluster globals; `keycloak-db-backup` covers
+    # the separate Keycloak instance. A failure is reported but does not abort the
+    # other job, so one broken dump cannot block the shutdown.
+    local jobs="db-backup keycloak-db-backup"
 
     for job in $jobs; do
         echo "Running ${job}..."
         compose -f "$COMPOSE_FILE" --profile backup --env-file "$ENV_FILE" run --rm "$job" || echo "${job} failed"
     done
     echo "Backups completed."
+}
+
+verify_stack() {
+    # Runs both scripts inside the postgres-init image, so no psql is needed on
+    # the host and all five role passwords come from the environment compose
+    # already assembles.
+    #
+    # MSYS_NO_PATHCONV=1 is not optional under Git Bash on Windows: it would
+    # otherwise rewrite /postgres/verify/... into a C:\ path before Docker ever
+    # sees it, and the container fails with `stat C:/Program: no such file`.
+    local status=0
+
+    echo "Proving database isolation..."
+    if ! MSYS_NO_PATHCONV=1 compose -f "$COMPOSE_FILE" --profile backend --env-file "$ENV_FILE" \
+        run --rm --no-deps --entrypoint /postgres/verify/isolation.sh postgres-init; then
+        status=1
+    fi
+
+    echo
+    echo "Proving every granted CRM write lands..."
+    if ! MSYS_NO_PATHCONV=1 compose -f "$COMPOSE_FILE" --profile backend --env-file "$ENV_FILE" \
+        run --rm --no-deps --entrypoint /postgres/verify/positive-writes.sh postgres-init; then
+        status=1
+    fi
+
+    if [ "$status" -ne 0 ]; then
+        echo
+        echo "Verification FAILED. See docker-compose/postgres/README.md."
+        exit 1
+    fi
+    echo
+    echo "Verification passed."
 }
 
 parse_start_options() {
@@ -140,6 +175,9 @@ main() {
             parse_start_options "$@"
             stop_stack
             start_stack
+            ;;
+        verify)
+            verify_stack
             ;;
         help|-h|--help)
             usage

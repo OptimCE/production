@@ -40,6 +40,10 @@ if /i "%COMMAND%"=="restart" (
     call :start_stack
     exit /b %errorlevel%
 )
+if /i "%COMMAND%"=="verify" (
+    call :verify_stack
+    exit /b %errorlevel%
+)
 if /i "%COMMAND%"=="help" goto :usage
 if /i "%COMMAND%"=="-h" goto :usage
 if /i "%COMMAND%"=="--help" goto :usage
@@ -54,6 +58,7 @@ echo Commands:
 echo   start      Pull images (optional) and start init, backend, then frontend
 echo   stop       Stop init, backend, and frontend profiles
 echo   restart    Stop then start
+echo   verify     Prove the database isolation and the CRM grant matrix
 echo   help       Show this help message
 echo.
 echo Options (for start/restart):
@@ -121,14 +126,40 @@ call :do_backup
 exit /b %errorlevel%
 
 :do_backup
-rem One entry per database in the backup profile. A failure is reported but does not
-rem abort the remaining dumps, so one broken annex cannot block the shutdown.
-for %%J in (crm-database-backup keycloak-db-backup allocation-key-db-backup simulation-key-db-backup news-board-db-backup billing-db-backup) do (
+rem Two jobs, because there are two instances. db-backup loops the five application
+rem databases plus the cluster globals; keycloak-db-backup covers the separate
+rem Keycloak instance. A failure is reported but does not abort the other job.
+for %%J in (db-backup keycloak-db-backup) do (
     echo Running %%J...
     %DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" --profile backup run --rm %%J
     if errorlevel 1 echo %%J failed
 )
 echo Backups completed.
+exit /b 0
+
+:verify_stack
+rem Runs both scripts inside the postgres-init image, so no psql is needed on the
+rem host and all five role passwords come from the environment compose already
+rem assembles. cmd.exe does not rewrite container paths, so no MSYS_NO_PATHCONV
+rem here — unlike docker-stack.sh under Git Bash.
+set "VERIFY_STATUS=0"
+
+echo Proving database isolation...
+%DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --profile backend --env-file "%ENV_FILE%" run --rm --no-deps --entrypoint /postgres/verify/isolation.sh postgres-init
+if errorlevel 1 set "VERIFY_STATUS=1"
+
+echo.
+echo Proving every granted CRM write lands...
+%DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --profile backend --env-file "%ENV_FILE%" run --rm --no-deps --entrypoint /postgres/verify/positive-writes.sh postgres-init
+if errorlevel 1 set "VERIFY_STATUS=1"
+
+if "%VERIFY_STATUS%"=="1" (
+    echo.
+    echo Verification FAILED. See docker-compose\postgres\README.md.
+    exit /b 1
+)
+echo.
+echo Verification passed.
 exit /b 0
 
 :parse_start_options

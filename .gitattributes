@@ -1,0 +1,11 @@
+# The provisioning scripts and their SQL are mounted into a Linux container and
+# executed by busybox `sh` and `psql`. This repo is edited on Windows, where
+# core.autocrlf=true would hand the container CRLF files — `provision.sh` then
+# dies on a stray \r and the whole stack refuses to start, with an error that
+# points nowhere near the cause. Pin them.
+docker-compose/postgres/**/*.sh   text eol=lf
+docker-compose/postgres/**/*.sql  text eol=lf
+docker-compose/schemas/*.sql      text eol=lf
+
+# Same reasoning for the entrypoint scripts the stack shells out to.
+docker-stack.sh                   text eol=lf

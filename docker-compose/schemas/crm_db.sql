@@ -15,6 +15,16 @@ CREATE TABLE IF NOT EXISTS community (
     website_url VARCHAR(255) NULL,
     logo_url VARCHAR(255) NULL,
     description TEXT NULL,
+    -- Energy-market regulator the community is notified to (region -> regulator is 1:1).
+    -- Coded value from the shared registry; see reference/regulators.json.
+    regulator VARCHAR(32) NOT NULL DEFAULT 'BE-WAL-CWAPE'
+        CHECK (regulator IN ('BE-WAL-CWAPE', 'BE-BRU-BRUGEL', 'BE-VLA-VREG')),
+    -- Legal & bank identity (all optional). The legal/registered address reuses
+    -- headquarters_address. account_holder_name is only set when it differs from legal_name.
+    vat_number VARCHAR(32) NULL,
+    legal_name VARCHAR(255) NULL,
+    iban VARCHAR(34) NULL,
+    account_holder_name VARCHAR(255) NULL,
     headquarters_address_id INTEGER NULL,
     auth_community_id VARCHAR(255) UNIQUE, -- External Auth provider link
     created_at TIMESTAMP DEFAULT current_timestamp,
@@ -204,6 +214,38 @@ BEFORE UPDATE ON meter
 FOR EACH ROW
 EXECUTE FUNCTION update_changetimestamp_column();
 
+-- Belgian municipalities reference data (source: opendata.brussels.be,
+-- "codes-ins-nis-postaux-belgique"). The dataset is loaded separately;
+-- this DDL only creates the structure.
+CREATE TABLE IF NOT EXISTS municipality (
+    nis_code   INT PRIMARY KEY,
+    fr_name    VARCHAR(255) NOT NULL,
+    nl_name    VARCHAR(255),
+    de_name    VARCHAR(255),
+    region_fr  VARCHAR(64),
+    region_nl  VARCHAR(64),
+    geo_point  JSONB,
+    geo_shape  JSONB,
+    created_at TIMESTAMP DEFAULT current_timestamp,
+    updated_at TIMESTAMP DEFAULT current_timestamp
+);
+CREATE INDEX idx_municipality_fr_name ON municipality (fr_name);
+CREATE INDEX idx_municipality_nl_name ON municipality (nl_name);
+
+CREATE TRIGGER update_municipality_modtime
+BEFORE UPDATE ON municipality
+FOR EACH ROW
+EXECUTE FUNCTION update_changetimestamp_column();
+
+CREATE TABLE IF NOT EXISTS municipality_postal_code (
+    postal_code VARCHAR(10) NOT NULL,
+    nis_code    INT NOT NULL REFERENCES municipality (nis_code) ON DELETE CASCADE,
+    PRIMARY KEY (postal_code, nis_code)
+);
+CREATE INDEX idx_municipality_postal_code_nis ON municipality_postal_code (
+    nis_code
+);
+
 CREATE TABLE IF NOT EXISTS sharing_operation (
     id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     name VARCHAR(255) NOT NULL,
@@ -221,6 +263,21 @@ CREATE TRIGGER update_sharing_operation_modtime
 BEFORE UPDATE ON sharing_operation
 FOR EACH ROW
 EXECUTE FUNCTION update_changetimestamp_column();
+
+-- Many-to-many join: sharing operations <-> municipalities they cover.
+CREATE TABLE IF NOT EXISTS sharing_operation_municipality (
+    id_sharing_operation INT NOT NULL REFERENCES sharing_operation (
+        id
+    ) ON DELETE CASCADE,
+    nis_code             INT NOT NULL REFERENCES municipality (
+        nis_code
+    ) ON DELETE RESTRICT,
+    created_at           TIMESTAMP DEFAULT current_timestamp,
+    PRIMARY KEY (id_sharing_operation, nis_code)
+);
+CREATE INDEX idx_sharing_op_muni_nis ON sharing_operation_municipality (
+    nis_code
+);
 
 CREATE TABLE IF NOT EXISTS sharing_operation_key (
     id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -351,6 +408,9 @@ CREATE TABLE IF NOT EXISTS app_user (
     nrn TEXT NULL,
     phone_number TEXT NULL,
     iban TEXT NULL,
+    -- Preferred language, persisted from the profile. Email has no other source
+    -- of truth: the frontend picks a language client-side per session.
+    locale VARCHAR(8) NULL,
     id_home_address INT,
     FOREIGN KEY (id_home_address) REFERENCES address (id),
     id_billing_address INT,
@@ -437,3 +497,133 @@ CREATE TRIGGER update_gestionnaire_invitation_modtime
 BEFORE UPDATE ON gestionnaire_invitation
 FOR EACH ROW
 EXECUTE FUNCTION update_changetimestamp_column();
+
+-- Tracks per-feature subscription state for each community. Rows are written
+-- by external annex services through their own /subscribe and /unsubscribe
+-- endpoints; the CRM backend reads this table to expose which annex modules
+-- a community has active.
+CREATE TABLE IF NOT EXISTS community_subscription (
+    id           INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    id_community INTEGER     NOT NULL,
+    feature      VARCHAR(64) NOT NULL,
+    is_active    BOOLEAN     NOT NULL DEFAULT FALSE,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_community_subscription_community_feature
+        UNIQUE (id_community, feature)
+);
+CREATE INDEX idx_community_subscription_community ON community_subscription (
+    id_community
+);
+
+CREATE TRIGGER update_community_subscription_modtime
+BEFORE UPDATE ON community_subscription
+FOR EACH ROW
+EXECUTE FUNCTION update_changetimestamp_column();
+
+-- Append-only audit trail. Rows are inserted via the AuditLogService helper
+-- and are never updated or deleted by application code. `user_id` is NOT a
+-- foreign key on purpose: `user_email` is denormalized at write time so the
+-- log survives user deletion / anonymization. `id_community` is nullable so
+-- background jobs running outside a request context can still emit entries.
+CREATE TABLE IF NOT EXISTS audit_log (
+    id              BIGSERIAL PRIMARY KEY,
+    id_community    INT REFERENCES community (id) ON DELETE CASCADE,
+    timestamp       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    action          VARCHAR(128) NOT NULL,
+    source          VARCHAR(32)  NOT NULL,
+    entity_type     VARCHAR(64)  NOT NULL,
+    entity_id       VARCHAR(64),
+    user_id         INT,
+    user_email      VARCHAR(256),
+    payload         JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_audit_log_community_timestamp
+    ON audit_log (id_community, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_log_community_entity
+    ON audit_log (id_community, entity_type, entity_id);
+CREATE INDEX IF NOT EXISTS idx_audit_log_community_action
+    ON audit_log (id_community, action);
+
+-- Durable per-user notifications. `id_user` is the recipient and mandatory scope
+-- (cascade-deleted with the user). `id_community` is nullable: a user can receive
+-- notifications outside any community context; when present it scopes the row to a
+-- community. `data` is a JSONB payload for type-specific context. Indexes are
+-- recipient-centric: list ordering / cursor, a partial unread-count index, and
+-- community scoping. Real-time delivery (SSE) is not part of this layer.
+CREATE TABLE IF NOT EXISTS notification (
+    id            BIGSERIAL PRIMARY KEY,
+    id_community  INT REFERENCES community (id) ON DELETE CASCADE,
+    id_user       INT NOT NULL REFERENCES app_user (id) ON DELETE CASCADE,
+    type          VARCHAR(128) NOT NULL,
+    data          JSONB NOT NULL DEFAULT '{}'::jsonb,
+    read_at       TIMESTAMPTZ,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_notification_user_id
+    ON notification (id_user, id DESC);
+CREATE INDEX IF NOT EXISTS idx_notification_user_unread
+    ON notification (id_user) WHERE read_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_notification_community
+    ON notification (id_community);
+
+-- ---- Notification delivery layer -------------------------------------------
+-- Mirrors database_script/2026-08-03_notification_delivery.sql; see that file
+-- for the full rationale (nullable id_notification for account-less invitees,
+-- literal recipient, persisted category, the CLAIMED status, and the fact that
+-- `data` is the idempotency key for all time).
+
+-- Channel-agnostic outbound queue. One row per (message, channel, recipient).
+CREATE TABLE IF NOT EXISTS outbound_message (
+    id              BIGSERIAL PRIMARY KEY,
+    id_notification BIGINT NULL REFERENCES notification (id) ON DELETE SET NULL,
+    id_community    INT NULL REFERENCES community (id) ON DELETE CASCADE,
+    -- Channel: 1 INAPP, 2 EMAIL
+    channel         SMALLINT NOT NULL CHECK (channel IN (1, 2)),
+    recipient       VARCHAR(320) NOT NULL,
+    recipient_name  VARCHAR(255) NULL,
+    -- '' means "unknown"; the dispatcher applies its own default locale.
+    locale          VARCHAR(8) NOT NULL DEFAULT '',
+    type            VARCHAR(128) NOT NULL,
+    -- NotificationCategory: 1 TRANSACTIONAL, 2 INFORMATIONAL
+    category        SMALLINT NOT NULL CHECK (category IN (1, 2)),
+    data            JSONB NOT NULL DEFAULT '{}'::jsonb,
+    dedupe_key      VARCHAR(200) NOT NULL,
+    -- 1 PENDING, 2 SENT, 3 FAILED, 4 SUPPRESSED, 5 CLAIMED
+    status          SMALLINT NOT NULL DEFAULT 1 CHECK (status IN (1, 2, 3, 4, 5)),
+    attempts        SMALLINT NOT NULL DEFAULT 0,
+    last_error      TEXT NULL,
+    scheduled_for   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    claimed_at      TIMESTAMPTZ NULL,
+    sent_at         TIMESTAMPTZ NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_outbound_message_dedupe
+    ON outbound_message (dedupe_key);
+CREATE INDEX IF NOT EXISTS ix_outbound_message_due
+    ON outbound_message (scheduled_for) WHERE status = 1;
+CREATE INDEX IF NOT EXISTS ix_outbound_message_stale
+    ON outbound_message (claimed_at) WHERE status = 5;
+
+-- Addresses that must never be emailed again. Stored lower-cased.
+CREATE TABLE IF NOT EXISTS email_suppression (
+    email      VARCHAR(320) PRIMARY KEY,
+    -- 1 HARD_BOUNCE, 2 COMPLAINT, 3 UNSUBSCRIBED, 4 MANUAL
+    reason     SMALLINT NOT NULL CHECK (reason IN (1, 2, 3, 4)),
+    detail     TEXT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Per-recipient channel policy. Consulted only for INFORMATIONAL notifications;
+-- TRANSACTIONAL overrides preference entirely and is not opt-out-able.
+CREATE TABLE IF NOT EXISTS notification_preference (
+    id_user     INT NOT NULL REFERENCES app_user (id) ON DELETE CASCADE,
+    -- '' = default for every type; else the first dot-segment of the type key.
+    type_prefix VARCHAR(128) NOT NULL,
+    -- Channel: 1 INAPP, 2 EMAIL
+    channel     SMALLINT NOT NULL CHECK (channel IN (1, 2)),
+    -- 1 IMMEDIATE, 3 OFF (2 DAILY_DIGEST reserved, no runner yet)
+    mode        SMALLINT NOT NULL CHECK (mode IN (1, 3)),
+
+    PRIMARY KEY (id_user, type_prefix, channel)
+);
