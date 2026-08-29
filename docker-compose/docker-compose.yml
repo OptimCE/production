@@ -336,6 +336,63 @@ services:
       retries: 5
       start_period: 15s
 
+  # Realtime SSE fan-out and the live ticket store. Nothing else uses it, and it
+  # is deliberately NOT the JetStream broker above: job dispatch must not lose
+  # messages, realtime is ALLOWED to. A separate container makes "realtime may
+  # drop" structurally true and stops anyone making it durable later.
+  #
+  # No volume, no AOF, no RDB: every key here is either a <=30s ticket or an
+  # in-flight PUBLISH, so losing everything on restart is CORRECT behaviour.
+  # `--save ""` also removes the fork-on-BGSAVE latency spike.
+  #
+  # --requirepass is NOT hygiene. Redis has no auth by default and the LIVE
+  # TICKET STORE lives in here: a ticket carries the exact channel list its
+  # holder may subscribe to, so an unauthenticated Redis on this network is an
+  # impersonation oracle for anything that can reach it.
+  #
+  # REDIS_PASSWORD is passed explicitly rather than through `env_file: .env`,
+  # which is what the development stack does. The healthcheck needs the value
+  # INSIDE the container - `$$REDIS_PASSWORD` is expanded by the container shell,
+  # not by compose - but env_file here would also hand the ticket store all seven
+  # database role passwords, the superuser password, the MinIO keys and the
+  # SMTP/Brevo credentials, none of which it has any use for.
+  #
+  # No published port. The development stack binds 127.0.0.1:8093 for its
+  # redis-cli recipes; here the equivalent is `docker compose exec redis`.
+  redis:
+    profiles: ["backend"]
+    image: redis:8-alpine@sha256:978f0e01593e65eed801f2402944efcd936d43b5027e4908a7897baf88ed6241
+    restart: unless-stopped
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+    command:
+      - "redis-server"
+      - "--save"
+      - ""
+      - "--appendonly"
+      - "no"
+      # allkeys-lru on a ticket store looks wrong and is right: a ticket is ~100
+      # bytes with a 30s TTL, 128mb is never reached, and under memory pressure
+      # eviction degrades to "some mints fail" rather than an OOM-kill.
+      - "--maxmemory"
+      - "128mb"
+      - "--maxmemory-policy"
+      - "allkeys-lru"
+      - "--requirepass"
+      - "${REDIS_PASSWORD}"
+    networks:
+      - redis
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping | grep -q PONG",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
   keycloak:
     profiles: ["backend"]
     image: quay.io/keycloak/keycloak:26.5.5@sha256:a7b0cb7a43a1235a61872883414d3f1d9a3ceac9df6e5907bd12202778a6265c
@@ -504,6 +561,48 @@ services:
       # Shared regulator registry. crm-backend fails fast (process.exit(1)) if this
       # path is unset or unreadable, so the mount below is mandatory.
       - REGULATORS_CONFIG_PATH=/app/reference/regulators.json
+      # ---- Realtime (SSE) ------------------------------------------------
+      # crm-backend is the HUB: it mints the single-use tickets and holds every
+      # open stream. The nine annexe services only publish.
+      #
+      # Redis logical db 1 on purpose: db 0 stays reserved for the currently
+      # dormant cache_service, which is a DIFFERENT switch. REALTIME_REDIS_URL is
+      # composed from REDIS_PASSWORD so the secret lives in exactly one place.
+      #
+      # With REALTIME_ENABLED=false nothing is bound, no Redis connection is
+      # opened, the ticket endpoint 503s and the SPA sits in polling - byte for
+      # byte the behaviour that predates this feature. That is the rollout AND
+      # the rollback. It ships false; flip it after the smoke test in
+      # docs/runbooks/realtime-sse.md.
+      - REALTIME_ENABLED=${REALTIME_ENABLED:-false}
+      - REALTIME_REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/1
+      # Every knob below has a coded default in config/production.cjs. They are
+      # pinned here because they are DoS ceilings, and "unset" means "whatever
+      # the next crm-backend image happens to default to".
+      - REALTIME_TICKET_TTL_SECONDS=${REALTIME_TICKET_TTL_SECONDS:-30}
+      - REALTIME_HEARTBEAT_SECONDS=${REALTIME_HEARTBEAT_SECONDS:-20}
+      - REALTIME_MAX_CONNECTION_SECONDS=${REALTIME_MAX_CONNECTION_SECONDS:-900}
+      - REALTIME_MAX_CONNECTIONS_PER_USER=${REALTIME_MAX_CONNECTIONS_PER_USER:-4}
+      # Read the nginx note in .env.example before raising this: each live stream
+      # costs TWO of nginx's worker_connections (client leg + upstream leg).
+      - REALTIME_MAX_CONNECTIONS=${REALTIME_MAX_CONNECTIONS:-500}
+      - REALTIME_MINT_PER_MINUTE=${REALTIME_MINT_PER_MINUTE:-30}
+      # ---- Address geocoding (map views) ---------------------------------
+      # LOCAL = pin drops plus the municipality centroid already stored in
+      # municipality.geo_point; no network call, ever. REMOTE additionally allows
+      # the two free Belgian public geocoders, and ONLY from the admin-only
+      # POST /geocoding/backfill. The inline chain on POST /meters stays local
+      # regardless - KrakenD's global timeout is 3000ms with no per-endpoint
+      # override, so a third-party call there is a 504 waiting to happen.
+      #
+      # The two URLs are left empty on purpose: production.cjs falls back with
+      # `|| "https://..."` and an empty string is falsy, so unset means "use the
+      # image default" while still leaving an operator an override slot.
+      - GEOCODING_MODE=${GEOCODING_MODE:-LOCAL}
+      - GEOCODING_WALLONIA_URL=${GEOCODING_WALLONIA_URL:-}
+      - GEOCODING_FLANDERS_URL=${GEOCODING_FLANDERS_URL:-}
+      - GEOCODING_TIMEOUT_MS=${GEOCODING_TIMEOUT_MS:-2000}
+      - GEOCODING_BATCH_MAX=${GEOCODING_BATCH_MAX:-1000}
     volumes:
       - ./reference:/app/reference:ro
     networks:
@@ -513,6 +612,10 @@ services:
       - keycloak
       - minio
       - opentelemetry
+      - redis
+      # For `location = ${WEB_REALTIME_PATH}` only - see the `sse` network
+      # comment at the bottom of this file.
+      - sse
     depends_on:
       postgres:
         condition: service_healthy
@@ -521,6 +624,13 @@ services:
       keycloak-healthcheck:
         condition: service_healthy
       minio:
+        condition: service_started
+      # service_STARTED, not service_healthy - deliberately weaker than the
+      # development stack. Realtime is a hint channel that must degrade to
+      # polling; gating the API on the ticket store being healthy would turn an
+      # unreachable Redis into "the entire CRM never starts". The healthcheck
+      # still runs and still shows red in `docker compose ps`.
+      redis:
         condition: service_started
 
   allocation-key-generation:
@@ -546,6 +656,16 @@ services:
       - STORAGE_ACCESS_KEY=${MINIO_ROOT_USER}
       - STORAGE_SECRET_KEY=${MINIO_ROOT_PASSWORD}
       - STORAGE_REGION=us-east-1
+      # Realtime (SSE hints) - fire-and-forget. Every failure mode (no config,
+      # unreachable broker, hung broker) is a silent no-op in
+      # core/realtime/bus.py: it never raises and never blocks a write.
+      #
+      # `:-false` is load-bearing, not cosmetic. REALTIME_ENABLED is a `bool` on a
+      # pydantic-settings model, compose renders an UNDEFINED variable as the empty
+      # string, and pydantic raises on "". Without the default, one partial .env
+      # crash-loops all nine annexe services at boot.
+      - REALTIME_ENABLED=${REALTIME_ENABLED:-false}
+      - REALTIME_REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/1
       - LOGGING_TOKEN=${LOGGING_TOKEN}
       - LOGGING_TRACES_URL=${LOGGING_TRACES_URL}
       - LOGGING_LOGS_URL=${LOGGING_LOGS_URL}
@@ -558,6 +678,7 @@ services:
       - nats
       - minio
       - opentelemetry
+      - redis
     depends_on:
       postgres:
         condition: service_healthy
@@ -588,6 +709,16 @@ services:
       - STORAGE_ACCESS_KEY=${MINIO_ROOT_USER}
       - STORAGE_SECRET_KEY=${MINIO_ROOT_PASSWORD}
       - STORAGE_REGION=us-east-1
+      # Realtime (SSE hints) - fire-and-forget. Every failure mode (no config,
+      # unreachable broker, hung broker) is a silent no-op in
+      # core/realtime/bus.py: it never raises and never blocks a write.
+      #
+      # `:-false` is load-bearing, not cosmetic. REALTIME_ENABLED is a `bool` on a
+      # pydantic-settings model, compose renders an UNDEFINED variable as the empty
+      # string, and pydantic raises on "". Without the default, one partial .env
+      # crash-loops all nine annexe services at boot.
+      - REALTIME_ENABLED=${REALTIME_ENABLED:-false}
+      - REALTIME_REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/1
       - LOGGING_TOKEN=${LOGGING_TOKEN}
       - LOGGING_TRACES_URL=${LOGGING_TRACES_URL}
       - LOGGING_LOGS_URL=${LOGGING_LOGS_URL}
@@ -602,6 +733,7 @@ services:
       - nats
       - minio
       - opentelemetry
+      - redis
     depends_on:
       postgres:
         condition: service_healthy
@@ -631,6 +763,16 @@ services:
       - STORAGE_ACCESS_KEY=${MINIO_ROOT_USER}
       - STORAGE_SECRET_KEY=${MINIO_ROOT_PASSWORD}
       - STORAGE_REGION=us-east-1
+      # Realtime (SSE hints) - fire-and-forget. Every failure mode (no config,
+      # unreachable broker, hung broker) is a silent no-op in
+      # core/realtime/bus.py: it never raises and never blocks a write.
+      #
+      # `:-false` is load-bearing, not cosmetic. REALTIME_ENABLED is a `bool` on a
+      # pydantic-settings model, compose renders an UNDEFINED variable as the empty
+      # string, and pydantic raises on "". Without the default, one partial .env
+      # crash-loops all nine annexe services at boot.
+      - REALTIME_ENABLED=${REALTIME_ENABLED:-false}
+      - REALTIME_REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/1
       - LOGGING_TOKEN=${LOGGING_TOKEN}
       - LOGGING_TRACES_URL=${LOGGING_TRACES_URL}
       - LOGGING_LOGS_URL=${LOGGING_LOGS_URL}
@@ -643,6 +785,7 @@ services:
       - nats
       - minio
       - opentelemetry
+      - redis
     depends_on:
       postgres:
         condition: service_healthy
@@ -673,6 +816,16 @@ services:
       - STORAGE_ACCESS_KEY=${MINIO_ROOT_USER}
       - STORAGE_SECRET_KEY=${MINIO_ROOT_PASSWORD}
       - STORAGE_REGION=us-east-1
+      # Realtime (SSE hints) - fire-and-forget. Every failure mode (no config,
+      # unreachable broker, hung broker) is a silent no-op in
+      # core/realtime/bus.py: it never raises and never blocks a write.
+      #
+      # `:-false` is load-bearing, not cosmetic. REALTIME_ENABLED is a `bool` on a
+      # pydantic-settings model, compose renders an UNDEFINED variable as the empty
+      # string, and pydantic raises on "". Without the default, one partial .env
+      # crash-loops all nine annexe services at boot.
+      - REALTIME_ENABLED=${REALTIME_ENABLED:-false}
+      - REALTIME_REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/1
       - LOGGING_TOKEN=${LOGGING_TOKEN}
       - LOGGING_TRACES_URL=${LOGGING_TRACES_URL}
       - LOGGING_LOGS_URL=${LOGGING_LOGS_URL}
@@ -687,6 +840,7 @@ services:
       - nats
       - minio
       - opentelemetry
+      - redis
     depends_on:
       postgres:
         condition: service_healthy
@@ -710,6 +864,16 @@ services:
       - LOCAL_DB_POOL_SIZE=5
       - LOCAL_DB_MAX_OVERFLOW=5
       - ALLOW_ORIGIN=${APP_CORS_ALLOWED_ORIGIN}
+      # Realtime (SSE hints) - fire-and-forget. Every failure mode (no config,
+      # unreachable broker, hung broker) is a silent no-op in
+      # core/realtime/bus.py: it never raises and never blocks a write.
+      #
+      # `:-false` is load-bearing, not cosmetic. REALTIME_ENABLED is a `bool` on a
+      # pydantic-settings model, compose renders an UNDEFINED variable as the empty
+      # string, and pydantic raises on "". Without the default, one partial .env
+      # crash-loops all nine annexe services at boot.
+      - REALTIME_ENABLED=${REALTIME_ENABLED:-false}
+      - REALTIME_REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/1
       - LOGGING_TOKEN=${LOGGING_TOKEN}
       - LOGGING_TRACES_URL=${LOGGING_TRACES_URL}
       - LOGGING_LOGS_URL=${LOGGING_LOGS_URL}
@@ -720,6 +884,7 @@ services:
       - database
       - news-board
       - opentelemetry
+      - redis
     depends_on:
       postgres:
         condition: service_healthy
@@ -782,6 +947,16 @@ services:
       # regimes bundled in the image; a missing file crashes the container.
       - REGULATORS_CONFIG_PATH=/app/reference/regulators.json
       - DEFAULT_LOCALE=fr-BE
+      # Realtime (SSE hints) - fire-and-forget. Every failure mode (no config,
+      # unreachable broker, hung broker) is a silent no-op in
+      # core/realtime/bus.py: it never raises and never blocks a write.
+      #
+      # `:-false` is load-bearing, not cosmetic. REALTIME_ENABLED is a `bool` on a
+      # pydantic-settings model, compose renders an UNDEFINED variable as the empty
+      # string, and pydantic raises on "". Without the default, one partial .env
+      # crash-loops all nine annexe services at boot.
+      - REALTIME_ENABLED=${REALTIME_ENABLED:-false}
+      - REALTIME_REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/1
       - LOGGING_TOKEN=${LOGGING_TOKEN}
       - LOGGING_TRACES_URL=${LOGGING_TRACES_URL}
       - LOGGING_LOGS_URL=${LOGGING_LOGS_URL}
@@ -796,6 +971,7 @@ services:
       - nats
       - minio
       - opentelemetry
+      - redis
     depends_on:
       postgres:
         condition: service_healthy
@@ -829,6 +1005,16 @@ services:
       - STORAGE_REGION=us-east-1
       - REGULATORS_CONFIG_PATH=/app/reference/regulators.json
       - DEFAULT_LOCALE=fr-BE
+      # Realtime (SSE hints) - fire-and-forget. Every failure mode (no config,
+      # unreachable broker, hung broker) is a silent no-op in
+      # core/realtime/bus.py: it never raises and never blocks a write.
+      #
+      # `:-false` is load-bearing, not cosmetic. REALTIME_ENABLED is a `bool` on a
+      # pydantic-settings model, compose renders an UNDEFINED variable as the empty
+      # string, and pydantic raises on "". Without the default, one partial .env
+      # crash-loops all nine annexe services at boot.
+      - REALTIME_ENABLED=${REALTIME_ENABLED:-false}
+      - REALTIME_REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/1
       - LOGGING_TOKEN=${LOGGING_TOKEN}
       - LOGGING_TRACES_URL=${LOGGING_TRACES_URL}
       - LOGGING_LOGS_URL=${LOGGING_LOGS_URL}
@@ -842,6 +1028,7 @@ services:
       - nats
       - minio
       - opentelemetry
+      - redis
     depends_on:
       postgres:
         condition: service_healthy
@@ -892,6 +1079,16 @@ services:
       - DOCGEN_RESULT_SUBJECT=docgen.result.administrative_document
       # Maps community.regulator -> the region whose deadline rules apply.
       - REGULATORS_CONFIG_PATH=/app/reference/regulators.json
+      # Realtime (SSE hints) - fire-and-forget. Every failure mode (no config,
+      # unreachable broker, hung broker) is a silent no-op in
+      # core/realtime/bus.py: it never raises and never blocks a write.
+      #
+      # `:-false` is load-bearing, not cosmetic. REALTIME_ENABLED is a `bool` on a
+      # pydantic-settings model, compose renders an UNDEFINED variable as the empty
+      # string, and pydantic raises on "". Without the default, one partial .env
+      # crash-loops all nine annexe services at boot.
+      - REALTIME_ENABLED=${REALTIME_ENABLED:-false}
+      - REALTIME_REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/1
       - LOGGING_TOKEN=${LOGGING_TOKEN}
       - LOGGING_TRACES_URL=${LOGGING_TRACES_URL}
       - LOGGING_LOGS_URL=${LOGGING_LOGS_URL}
@@ -905,6 +1102,7 @@ services:
       - nats
       - minio
       - opentelemetry
+      - redis
     depends_on:
       postgres:
         condition: service_healthy
@@ -939,6 +1137,16 @@ services:
       - DOCGEN_REQUEST_SUBJECT=docgen.request
       - DOCGEN_RESULT_SUBJECT=docgen.result.administrative_document
       - REGULATORS_CONFIG_PATH=/app/reference/regulators.json
+      # Realtime (SSE hints) - fire-and-forget. Every failure mode (no config,
+      # unreachable broker, hung broker) is a silent no-op in
+      # core/realtime/bus.py: it never raises and never blocks a write.
+      #
+      # `:-false` is load-bearing, not cosmetic. REALTIME_ENABLED is a `bool` on a
+      # pydantic-settings model, compose renders an UNDEFINED variable as the empty
+      # string, and pydantic raises on "". Without the default, one partial .env
+      # crash-loops all nine annexe services at boot.
+      - REALTIME_ENABLED=${REALTIME_ENABLED:-false}
+      - REALTIME_REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/1
       - LOGGING_TOKEN=${LOGGING_TOKEN}
       - LOGGING_TRACES_URL=${LOGGING_TRACES_URL}
       - LOGGING_LOGS_URL=${LOGGING_LOGS_URL}
@@ -951,6 +1159,7 @@ services:
       - nats
       - minio
       - opentelemetry
+      - redis
     depends_on:
       postgres:
         condition: service_healthy
@@ -1005,6 +1214,12 @@ services:
       - SMTP_TLS=${SMTP_TLS}
       - BREVO_API_KEY=${BREVO_API_KEY}
       - BREVO_BASE_URL=${BREVO_BASE_URL}
+      # Brevo reports bounces by webhook only, and this service has no inbound
+      # HTTP surface by design, so it polls the blocked-contact list instead.
+      # 0 disables the sync. Unset, it silently took the image default - and this
+      # poll is the only path by which a hard bounce ever reaches
+      # email_suppression.
+      - BREVO_SUPPRESSION_SYNC_INTERVAL_SECONDS=${BREVO_SUPPRESSION_SYNC_INTERVAL_SECONDS:-3600}
       - DISPATCH_POLL_INTERVAL_SECONDS=${DISPATCH_POLL_INTERVAL_SECONDS}
       - DEFAULT_LOCALE=${EMAIL_DEFAULT_LOCALE}
       - LOGGING_TOKEN=${LOGGING_TOKEN}
@@ -1045,10 +1260,27 @@ services:
     # mention this file. If a migrator release adds a database, it must be added
     # here in the same deploy — or scope the run with `--database <name>`.
     #
+    # That prediction has now come true: the image manages SIX databases as of
+    # the release that adds migrations/allocation-key, migrations/simulation-key
+    # and migrations/news-board. This file and the image are updated by two
+    # DIFFERENT commands (`git pull` and `docker compose pull`) and nothing
+    # enforces their order — pull the repo first. Reversed, the run exits 1 at
+    # config-resolution time, before a single connection is opened, so the blast
+    # radius is a failed one-shot rather than a half-migrated database.
+    #
+    # news-board carries an EMPTY manifest today. Its URL is here so that the day
+    # it gets its first migration is a one-repo change, not a coordinated edit of
+    # this file and the migrator in the same breath.
+    #
     # Each connects as that database's OWNING role, so objects a migration
     # creates are owned by the role ALTER DEFAULT PRIVILEGES is attached to.
+    # Every DSN below is byte-identical to the LOCAL_DATABASE_URL its owning
+    # service already uses: same role, same password variable, same database.
     environment:
       - OPTIMCE_CRM_DATABASE_URL=postgresql+asyncpg://crm_svc:${CRM_DB_PASSWORD}@postgres:5432/crm_db
+      - OPTIMCE_ALLOCATION_KEY_DATABASE_URL=postgresql+asyncpg://allocation_key_svc:${ALLOCATION_KEY_DB_PASSWORD}@postgres:5432/allocation_key_local
+      - OPTIMCE_SIMULATION_KEY_DATABASE_URL=postgresql+asyncpg://simulation_key_svc:${SIMULATION_KEY_DB_PASSWORD}@postgres:5432/simulation_key_local
+      - OPTIMCE_NEWS_BOARD_DATABASE_URL=postgresql+asyncpg://news_board_svc:${NEWS_BOARD_DB_PASSWORD}@postgres:5432/news_board_local
       - OPTIMCE_BILLING_DATABASE_URL=postgresql+asyncpg://billing_svc:${BILLING_DB_PASSWORD}@postgres:5432/billing_local
       - OPTIMCE_ADMINISTRATIVE_DOCUMENT_DATABASE_URL=postgresql+asyncpg://administrative_document_svc:${ADMINISTRATIVE_DOCUMENT_DB_PASSWORD}@postgres:5432/administrative_document_local
     networks:
@@ -1081,6 +1313,9 @@ services:
       - api-gateway
       - keycloak
       - crm
+      # For `location = ${WEB_REALTIME_PATH}` only. Everything else still goes
+      # via krakend over `api-gateway`.
+      - sse
 
   certbot:
     profiles: ["frontend"]
@@ -1203,3 +1438,27 @@ networks:
   nats:
   minio:
   opentelemetry:
+  # The realtime ticket store and pub/sub bus. Membership IS the access-control
+  # list: crm-backend (the hub, which mints tickets and fans out) plus the nine
+  # publishers, and nothing else.
+  #
+  # A dedicated network rather than reusing `crm` - which all ten of those
+  # services already share - because `crm` is the network every NEW annexe joins
+  # by convention. Reusing it would silently grant the next service added to this
+  # file read access to every in-flight ticket. Here, joining is an opt-in that
+  # shows up in review.
+  redis:
+  # reverse-proxy <-> crm-backend, for `location = ${WEB_REALTIME_PATH}` - the one
+  # path that bypasses the API gateway.
+  #
+  # Unlike the development stack, this network is DECLARATIVE, not load-bearing:
+  # here reverse-proxy and crm-backend already share `api-gateway` (both need
+  # krakend) and `crm`, so removing this would not stop nginx resolving
+  # crm-backend. It names the legitimate path and keeps this file diff-able
+  # against docker-compose.dev.yml.
+  #
+  # The property that IS enforced: crm-frontend is on `reverse-proxy` ONLY, and
+  # crm-backend is not on `reverse-proxy`. crm-backend authenticates nothing - it
+  # trusts x-user-id blindly - so a compromised static frontend must never be able
+  # to resolve it. See docs/runbooks/realtime-sse.md for the DNS probe.
+  sse:

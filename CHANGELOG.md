@@ -8,6 +8,138 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Added (realtime SSE and maps)
+
+- **`redis`** — the realtime ticket store and pub/sub bus, on a new `redis` network
+  joined by `crm-backend` and the nine publishers and nothing else. No volume, no
+  AOF, no RDB: every key is a <=30 s ticket or an in-flight PUBLISH, so losing
+  everything on restart is correct. Digest-pinned, like `postgres` and `keycloak`,
+  because it holds a live credential store.
+  - `REDIS_PASSWORD` is not hygiene. A ticket carries the exact channel list its
+    holder may subscribe to, so an unauthenticated Redis on that network is an
+    impersonation oracle. Use URL-safe characters — the value is interpolated into
+    `REALTIME_REDIS_URL` in userinfo position, so `@ : / # ?` corrupt the DSN and
+    `$` is eaten by compose.
+  - It is passed as an explicit `environment:` entry rather than through
+    `env_file: .env`, which is what the development stack does. `env_file` here
+    would hand the ticket store all seven database role passwords, the superuser
+    password, the MinIO keys and the SMTP/Brevo credentials.
+  - `crm-backend` gates on `service_started`, **not** `service_healthy` as the
+    development stack does. Realtime must degrade to polling; gating on health
+    would turn an unreachable ticket store into "the entire CRM API never starts".
+- **`REALTIME_ENABLED` ships `false`.** With it false the ticket endpoint 503s,
+  crm-backend opens no Redis connection, every producer's `emit()` is a no-op, and
+  the SPA polls exactly as before. That is both the rollout and the rollback, and
+  it is why this can land outside a maintenance window. Switching it on is a
+  documented, separately reversible step — see
+  [`docs/runbooks/realtime-sse.md`](docs/runbooks/realtime-sse.md).
+- `location = ${WEB_REALTIME_PATH}` in both nginx templates, plus the
+  `upstream crm-backend` it proxies to. Exact match, `proxy_pass` with no URI
+  path, and the five gateway-trust headers cleared to empty so nginx drops them:
+  crm-backend authenticates nothing and trusts `x-user-id`, so a prefix match or a
+  trailing slash would expose the whole API unauthenticated.
+  - **The reverse proxy now refuses to start unless `crm-backend` resolves.**
+    nginx resolves `upstream` server names at config load. Start `backend` before
+    `frontend`, as `docker-stack.sh` already does.
+  - The HTTPS template's two port-80 blocks gained a ticket-preserving 301 that
+    keeps `?t=` and stays out of the access log. It is present on the `s3.` vhost
+    too, where it is inert — the runbook's bring-up check counts occurrences.
+- `realtimeUrl` and `map.styleUrl` in `crm-frontend-config/config.template.json`,
+  both rendered from the same `.env` values as the nginx location, so the client
+  and the proxy cannot drift into a permanent silent fallback. `realtimeUrl`
+  deliberately falls outside `keycloak.urlPattern`: EventSource cannot carry a
+  bearer token, so an interceptor attaching one would be misleading.
+- The `GEOCODING_*` block on `crm-backend`, shipping `GEOCODING_MODE=LOCAL`.
+  REMOTE is outbound traffic to two third-party geocoders carrying member address
+  strings, and is reached only from the admin-only `POST /geocoding/backfill` —
+  see [`docs/runbooks/map-views.md`](docs/runbooks/map-views.md).
+- `WEB_REALTIME_PATH`, `WEB_MAP_STYLE_URL`, `CRM_BACKEND_UPSTREAM`,
+  `CRM_BACKEND_PROTOCOL`, the `REALTIME_*` ceilings and the `GEOCODING_*` block in
+  `docker-compose/.env.example`. The upstream pair lives in `.env` rather than
+  inline on the service, because this deployment's `nginx-config` reads its
+  upstreams through `env_file`.
+
+### Added (migrations)
+
+- **`./docker-stack.sh migrate`** (and `docker-stack.bat migrate`), with
+  `--dry-run` and `--no-pull`. It pulls `optimce-migrator`, runs it, and **always**
+  re-runs `postgres-init` afterwards — including after a failure, because each
+  migration commits in its own transaction and tables that landed arrive
+  ungranted, which is silent at runtime rather than loud. This packages
+  [DATABASE_CONSOLIDATION.md](DATABASE_CONSOLIDATION.md) §9.1.
+- **`optimce-migrator` now receives six database URLs, not three.** The image has
+  grown `migrations/allocation-key`, `migrations/simulation-key` and
+  `migrations/news-board`. `allocation_key_local` and `simulation_key_local` each
+  owe a migration the deployed images already expect — a CRM-sourced generation or
+  simulation writes `source`, `id_sharing_operation`, `period_start`, `period_end`
+  and `data_warnings`, and until now there was no mechanism to add them to a live
+  database. `news-board` carries an empty manifest and is registered ahead of need,
+  so its first migration is a one-repo change.
+  - **Pull this repo before pulling the image.** The migrator resolves its whole
+    config up front and raises on the first missing variable; reversed, the run
+    exits 1 naming an environment variable and not the file it belongs in. It
+    fails before opening a connection, so the blast radius is a failed one-shot.
+  - `ALLOCATION_KEY_DB_PASSWORD`, `SIMULATION_KEY_DB_PASSWORD` and
+    `NEWS_BOARD_DB_PASSWORD` are now consumed twice: by their own service, and by
+    the migrator connecting as the same owning role. No new secret.
+
+### Fixed
+
+- **Every upload larger than 1 MB was 413'd by nginx itself.** Neither template
+  set `client_max_body_size`, so nginx's implicit 1 MB default applied — and the
+  refusal is generated by nginx, as a bare HTML page that never reaches the app,
+  so it carries no `error_code` the frontend can turn into a message. Now 2 MB at
+  server level and 50 MB inside `location /api/`, mirroring the annexes'
+  `MAX_BODY_BYTES` / `UPLOAD_MAX_BODY_BYTES`.
+- **The SPA fallback refused legitimate deep links.** It tested `$request_uri`,
+  which carries the query string, so `?email=a@b.com` or
+  `?ref=https%3A%2F%2Fpartner.be` looked like a file extension and returned 404.
+  It now tests `$uri`.
+- **The vendored baselines were behind the monorepo again.**
+  `schemas/crm_db.sql` was missing the whole `address` geolocation block
+  (`latitude`, `longitude`, `geo_precision`, `geo_source`, `geocoded_at`,
+  `geocode_status`, both CHECK constraints and the partial queue index), so a
+  rebuild from an empty volume produced a CRM on which every map query and the
+  geocoding backfill fail at the SQL level. `allocation_key_local.sql` and
+  `simulation_key_local.sql` were missing `generation.source` / `simulation.source`
+  and their period columns, so every CRM-sourced run would have been rejected by a
+  `NOT NULL` on `file_storage_key`. All six baselines now match their monorepo
+  source exactly. Inert for a running deployment — these are applied only to a
+  database with no relations.
+  - The CRM baseline tracks `crm-backend/database_script/init.sql`, **not**
+    `crm-backend/tests/sql/init.sql`. The latter is what the development stack
+    mounts and it carries 72 fixture `INSERT`s plus eight sequence resets.
+- `notification-dispatch` now receives `BREVO_SUPPRESSION_SYNC_INTERVAL_SECONDS`.
+  Unset, it silently took the image default; Brevo reports bounces by webhook only
+  and this service has no inbound HTTP surface by design, so this poll is the only
+  path by which a hard bounce ever reaches `email_suppression`.
+- `docker-stack.sh` / `.bat` now refuse to start the frontend profile when
+  `crm-frontend-config/config.json` is missing or is a **directory**. Docker
+  creates a missing single-file bind source as a directory, and the app then
+  serves a blank page with nothing useful in any log. The obvious fix — a
+  `depends_on` on `crm-frontend-config` — is not available: it lives in the `init`
+  profile and compose rejects a `depends_on` target outside the enabled profiles,
+  which would break `--profile frontend up -d` outright.
+
+### Notes
+
+- **A realtime failure is indistinguishable from a quiet system.** The pollers keep
+  the UI correct when push is dead, so "nobody complained" is not evidence — three
+  defects shipped upstream exactly this way. The check that can see it is the
+  startup log line: every producer logs `Realtime disabled — <component> publishes
+  nothing` or `Realtime publisher ready — …`. **An image that predates the feature
+  logs neither, while its environment variables look perfectly correct.** That is
+  this deployment's replacement for the development stack's `--build` discipline:
+  here, compare image digests and read the log line.
+- `REALTIME_MAX_CONNECTIONS` is capped at 500 rather than the image's 2000. Each
+  live stream consumes two of nginx's `worker_connections` (client leg + upstream
+  leg) and the stock nginx image allows 1024 per worker. Raise the two together or
+  neither.
+- The `sse` network is **declarative here, not load-bearing**: `reverse-proxy` and
+  `crm-backend` already share `api-gateway` and `crm`, so removing it would not
+  stop nginx resolving crm-backend. The property that is enforced is that
+  `crm-frontend` shares no network with `crm-backend`.
+
 ### Added
 
 - **administrative-document** (API + worker) and **notification-dispatch**

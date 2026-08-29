@@ -6,6 +6,7 @@ ENV_FILE="docker-compose/.env"
 WAIT_INIT_SECONDS=10
 WAIT_BACKEND_SECONDS=10
 PULL_IMAGES=true
+MIGRATE_DRY_RUN=false
 
 usage() {
     cat <<'EOF'
@@ -15,6 +16,7 @@ Commands:
     start      Pull images (optional) and start init, backend, then frontend
     stop       Stop init, backend, and frontend profiles
     restart    Stop then start
+    migrate    Apply pending database migrations, then re-converge the grants
     verify     Prove the database isolation and the CRM grant matrix
     help       Show this help message
 
@@ -22,6 +24,10 @@ Options (for start/restart):
     --no-pull                  Skip image pull before starting
     --wait-init <seconds>      Wait after init profile (default: 10)
     --wait-backend <seconds>   Wait after backend profile (default: 10)
+
+Options (for migrate):
+    --no-pull                  Skip the optimce-migrator image pull
+    --dry-run                  Report pending migrations without applying them
 EOF
 }
 
@@ -71,7 +77,39 @@ start_stack() {
     echo "Waiting for backend initialization to complete..."
     sleep "$WAIT_BACKEND_SECONDS"
 
+    check_frontend_config
     compose -f "$COMPOSE_FILE" --profile frontend --env-file "$ENV_FILE" up -d
+}
+
+check_frontend_config() {
+    # crm-frontend bind-mounts a SINGLE FILE, config.json, over the one inside the
+    # image. Docker creates a missing bind source as a DIRECTORY, and nginx then
+    # serves a directory where the SPA expects its configuration: the app loads to
+    # a blank page with nothing useful in any log.
+    #
+    # The obvious fix - `depends_on: crm-frontend-config` on crm-frontend - is not
+    # available: crm-frontend-config is in the `init` profile and crm-frontend in
+    # `frontend`, and compose rejects a depends_on target that is not in an enabled
+    # profile ("depends on undefined service"). It would break `--profile frontend
+    # up -d` outright. This check is the substitute; `start` runs the init profile
+    # first, so by here the file must exist.
+    local cfg="docker-compose/crm-frontend-config/config.json"
+
+    if [ -d "$cfg" ]; then
+        echo "ERROR: ${cfg} is a DIRECTORY."
+        echo "Docker created it because the init profile had not rendered the file yet."
+        echo "Remove it and re-run the init profile:"
+        echo "    rmdir ${cfg}"
+        echo "    ${DOCKER_COMPOSE_CMD[*]} -f ${COMPOSE_FILE} --profile init --env-file ${ENV_FILE} up -d"
+        exit 1
+    fi
+
+    if [ ! -f "$cfg" ]; then
+        echo "ERROR: ${cfg} does not exist."
+        echo "It is rendered from config.template.json by the init profile."
+        echo "Run the init profile before the frontend profile."
+        exit 1
+    fi
 }
 
 stop_stack() {
@@ -134,6 +172,75 @@ verify_stack() {
     echo "Verification passed."
 }
 
+migrate_stack() {
+    # The migrator is in the `migration` profile but depends_on postgres and
+    # postgres-init, which are in `backend` - so BOTH profiles must be active or
+    # compose refuses the project with "depends on undefined service". Naming the
+    # service keeps the run scoped to it; its dependencies are already up.
+    check_docker_service
+
+    if [ "$PULL_IMAGES" = true ]; then
+        compose -f "$COMPOSE_FILE" --profile backend --profile migration pull optimce-migrator
+    fi
+
+    if [ "$MIGRATE_DRY_RUN" = true ]; then
+        echo "Reporting pending migrations (nothing will be applied)..."
+        compose -f "$COMPOSE_FILE" --profile backend --profile migration --env-file "$ENV_FILE" \
+            run --rm optimce-migrator --dry-run
+        return
+    fi
+
+    echo "Applying pending migrations..."
+    echo
+    echo "NOTE: the annexe migrations take ACCESS EXCLUSIVE on generation/simulation."
+    echo "      With lock_timeout at its default of 0, a running allocation-key or"
+    echo "      simulation-key worker holding a transaction makes this wait forever -"
+    echo "      and every later query then queues behind it. Stop those four services"
+    echo "      first, or run this before the backend profile is up."
+    echo
+
+    # `|| status=$?` rather than letting `set -e` abort here: each migration commits
+    # in its own transaction, so a failure part-way leaves earlier ones APPLIED and
+    # ungranted. postgres-init must run over whatever landed before we report the
+    # failure - a missing CRM grant is silent at runtime, not loud.
+    local status=0
+    compose -f "$COMPOSE_FILE" --profile backend --profile migration --env-file "$ENV_FILE" \
+        run --rm optimce-migrator || status=$?
+
+    echo
+    echo "Re-converging grants over whatever the migrator created..."
+    compose -f "$COMPOSE_FILE" --profile backend --env-file "$ENV_FILE" run --rm postgres-init
+
+    if [ "$status" -ne 0 ]; then
+        echo
+        echo "Migration FAILED (exit ${status}). Grants were converged over what landed."
+        echo "See DATABASE_CONSOLIDATION.md 9.1 before retrying."
+        exit "$status"
+    fi
+
+    echo
+    echo "Migrations applied and grants converged. Run './docker-stack.sh verify' next."
+}
+
+parse_migrate_options() {
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --no-pull)
+                PULL_IMAGES=false
+                ;;
+            --dry-run)
+                MIGRATE_DRY_RUN=true
+                ;;
+            *)
+                echo "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+        esac
+        shift
+    done
+}
+
 parse_start_options() {
     while [ "$#" -gt 0 ]; do
         case "$1" in
@@ -183,6 +290,10 @@ main() {
             parse_start_options "$@"
             stop_stack
             start_stack
+            ;;
+        migrate)
+            parse_migrate_options "$@"
+            migrate_stack
             ;;
         verify)
             verify_stack

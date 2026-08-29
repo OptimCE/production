@@ -72,6 +72,7 @@ them into their final form (`prod-config.json`, `config.json`,
 | krakend | API Gateway | http://localhost/api |
 | minio | S3-compatible storage | internal |
 | nats | JetStream message broker | internal |
+| redis | Realtime (SSE) ticket store and pub/sub bus | internal |
 | reverse-proxy | NGINX reverse proxy | http://localhost |
 
 ## Commands
@@ -81,6 +82,8 @@ them into their final form (`prod-config.json`, `config.json`,
 ./docker-stack.sh start --no-pull # Skip image pulls
 ./docker-stack.sh stop            # Stop all (triggers automatic backup)
 ./docker-stack.sh restart         # Restart (triggers automatic backup)
+./docker-stack.sh migrate         # Apply pending migrations, then re-converge grants
+./docker-stack.sh migrate --dry-run  # Report what is pending, change nothing
 ./docker-stack.sh verify          # Prove database isolation and the CRM grants
 ./docker-stack.sh help            # Show usage
 ```
@@ -100,20 +103,41 @@ Docker Compose profiles control which services start:
 | Profile | Services | Purpose |
 |---------|----------|---------|
 | `init` | swagger-doc-gen, generation-doc-gen, simulation-doc-gen, news-board-doc-gen, billing-doc-gen, administrative-document-doc-gen, krakend-config, keycloak-config, nginx-config, crm-frontend-config, keycloak-group-id-mapper, keycloak-optimce-theme | One-shot config generators and provider downloads |
-| `backend` | postgres, postgres-init, keycloak-db, keycloak, keycloak-healthcheck, crm-backend, allocation-key-generation (+ worker), simulation-key (+ worker), news-board, billing (+ worker), administrative-document (+ worker), document-generation, notification-dispatch, nats, minio, minio-init, krakend | Core infrastructure |
+| `backend` | postgres, postgres-init, keycloak-db, keycloak, keycloak-healthcheck, crm-backend, allocation-key-generation (+ worker), simulation-key (+ worker), news-board, billing (+ worker), administrative-document (+ worker), document-generation, notification-dispatch, nats, redis, minio, minio-init, krakend | Core infrastructure |
 | `frontend` | reverse-proxy, certbot, crm-frontend | Web serving layer |
-| `migration` | optimce-migrator | One-shot CRM schema migrations |
+| `migration` | optimce-migrator | One-shot schema migrations, all six databases |
 | `backup` | db-backup, keycloak-db-backup | Database backup services |
 
 Default startup runs `init`, then `backend`, then `frontend`.
 
+**Use `./docker-stack.sh migrate`**, not the raw compose commands. It does the same
+thing and then re-runs `postgres-init`, which is not optional: objects the migrator
+creates arrive with no grant for the annexe roles until the matrix reconverges, and a
+missing CRM grant is silent at runtime — the API returns 200 and the row never appears.
+It re-converges even when the migrator fails, because each migration commits in its own
+transaction, so a part-way failure leaves earlier ones applied and ungranted.
+
 The `migration` profile must be combined with `backend`, since the migrator depends on
-`postgres` and `postgres-init`:
+`postgres` and `postgres-init`. Underneath, the command runs:
 
 ```bash
+docker compose --profile backend --profile migration pull optimce-migrator
 docker compose --profile backend --profile migration run --rm optimce-migrator --dry-run
 docker compose --profile backend --profile migration run --rm optimce-migrator
+docker compose --profile backend run --rm postgres-init
 ```
+
+The migrator manages **six** databases and needs one URL for each — they are supplied by
+the `optimce-migrator` block in `docker-compose.yml`, built from the role passwords
+already in `.env`. It resolves the whole set up front and exits 1 on the first one it
+cannot find, before opening a connection. **Pull this repo before pulling the image**: a
+migrator release that adds a database ships its URL in the same commit.
+
+Before migrating, stop `allocation-key-generation`, `allocation-key-generation-worker`,
+`simulation-key` and `simulation-key-worker`. The annexe migrations take
+`ACCESS EXCLUSIVE` on `generation` and `simulation`; with `lock_timeout` at its default
+of 0, a worker holding an open transaction makes the migrator wait forever, and every
+later query then queues behind the migrator.
 
 ## Databases
 
@@ -146,6 +170,52 @@ roles, passwords, databases, ownership and grants — see
 
 Migrating an existing split-instance deployment into this layout is documented in
 [DATABASE_CONSOLIDATION.md](DATABASE_CONSOLIDATION.md).
+
+## Realtime (SSE) and maps
+
+The notification bell and the module dashboards can be pushed to rather than polled.
+The design has two legs, and only the second one is unusual:
+
+1. **Mint** — `POST /api/notifications/realtime/ticket`, behind KrakenD like every other
+   call, returns a single-use ticket with a short TTL.
+2. **Stream** — `GET ${WEB_REALTIME_PATH}` (default `/realtime/stream`), which
+   **bypasses the API gateway**. It has to: `EventSource` cannot send an `Authorization`
+   header, so KrakenD's validator can never be satisfied, and KrakenD buffers and
+   JSON-decodes with a 3000 ms global timeout. nginx proxies this one exact path
+   straight to `crm-backend`, clearing the five gateway-trust headers so they cannot be
+   forged on the way in. The ticket in `?t=` is the only credential.
+
+`redis` holds the tickets and carries the pub/sub fan-out. It is deliberately not the
+NATS broker: job dispatch must not lose messages, realtime is allowed to.
+
+**`REALTIME_ENABLED` ships `false`.** With it false the ticket endpoint 503s,
+`crm-backend` opens no Redis connection, every annexe `emit()` is a no-op, and the SPA
+polls exactly as it did before. That is the rollout and the rollback both — flipping the
+variable and running `docker compose --profile backend up -d` is the whole operation in
+either direction.
+
+> A realtime failure is **indistinguishable from a quiet system**: the pollers keep the
+> UI correct, so "nobody complained" proves nothing. The signal is the startup log line —
+> each of the nine producers logs `Realtime disabled — … publishes nothing` or
+> `Realtime publisher ready — …`. An image built before the feature logs **neither**,
+> while its environment variables look perfectly correct.
+
+Two consequences worth knowing before the first deploy:
+
+- **The reverse proxy now refuses to start unless `crm-backend` resolves.** nginx
+  resolves `upstream` names at config load. Start `backend` before `frontend` —
+  `docker-stack.sh` already does.
+- `WEB_REALTIME_PATH` renders **both** the nginx location and the frontend's
+  `config.json`, so they cannot drift. Leaving it empty renders `location =  {`, an
+  nginx syntax error that takes the proxy down.
+
+The map views (meters as pins, communities as commune zones) need coordinates on
+`address`, which arrive as a CRM migration — not from this repo. `GEOCODING_MODE` ships
+`LOCAL`, which never leaves the process; `REMOTE` additionally allows two free Belgian
+public geocoders and is reachable only from the admin-only `POST /geocoding/backfill`.
+
+Full procedures: [`docs/runbooks/realtime-sse.md`](docs/runbooks/realtime-sse.md) and
+[`docs/runbooks/map-views.md`](docs/runbooks/map-views.md).
 
 ## Automatic Backups
 
@@ -197,8 +267,10 @@ published images, so they must be kept in sync when the corresponding service ch
 | Path | Source | Consumed by |
 |------|--------|-------------|
 | `docker-compose/reference/regulators.json` | monorepo `reference/regulators.json` | `crm-backend`, `billing`, `billing-worker` (mounted read-only at `/app/reference`) |
-| `docker-compose/schemas/<database>.sql` | each service's `scripts/sql/schema.sql` | `postgres-init`, applied only to an **empty** database |
+| `docker-compose/schemas/crm_db.sql` | monorepo `crm-backend/database_script/init.sql` | `postgres-init`, applied only to an **empty** database |
+| `docker-compose/schemas/<annexe>.sql` | each annexe's `scripts/sql/schema.sql` | `postgres-init`, applied only to an **empty** database |
 | `docker-compose/document-templates/billing/` | `billing/document-templates/billing/` | seeded into the `optimce-templates` bucket by `minio-init` |
+| `docker-compose/document-templates/administrative-document/` | `administrative-document/document-templates/administrative-document/` | seeded into the same bucket by `minio-init` |
 
 The files under `docker-compose/schemas/` are disaster-recovery baselines, not
 migrations: `postgres-init` applies one only when its database has no table at
@@ -206,6 +278,18 @@ all. `crm_db.sql` in particular is the v0 baseline — the live CRM schema is
 carried forward by the `migration` profile, and re-applying the baseline would
 destroy data (it opens with `DROP SCHEMA public CASCADE`), which is exactly what
 the guard prevents.
+
+> **`crm_db.sql` tracks `crm-backend/database_script/init.sql`, never
+> `crm-backend/tests/sql/init.sql`.** The development stack mounts the latter, and it is
+> the same schema plus 72 fixture `INSERT`s — fake addresses, users, communities and
+> meters — and eight `ALTER TABLE … RESTART WITH 10` sequence resets. Copying the wrong
+> one seeds fake tenants into a freshly built production CRM.
+
+An annexe's `schema.sql` self-inserts a `schema_version` row for **every version it
+already embodies**, so a fresh install lands at that annexe's current version and the
+migrator correctly reports nothing pending. That is the property that makes a
+rebuild-from-empty and a migrated database converge — and it only holds while these
+files are actually in sync with the monorepo.
 
 `crm-backend` and `billing` both **fail to start** if `regulators.json` is missing or unreadable —
 there is no fallback path. Marking an additional regulator `active` also requires a matching billing

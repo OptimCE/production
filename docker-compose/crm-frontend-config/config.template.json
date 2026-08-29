@@ -1,6 +1,10 @@
 {
 	"apiUrl": "${DOMAIN}${WEB_API_URL}",
 	"basePath": "${WEB_BASE_PATH}",
+	"realtimeUrl": "${DOMAIN}${WEB_REALTIME_PATH}",
+	"map": {
+		"styleUrl": "${WEB_MAP_STYLE_URL}"
+	},
 	"keycloak": {
 		"realm": "${AUTH_REALM}",
 		"url": "${DOMAIN}${WEB_AUTH_URL}",
