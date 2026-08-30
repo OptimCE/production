@@ -167,7 +167,7 @@ services:
         WORK=$$(mktemp -d)
         JAR=/data/keycloak-theme-for-kc-all-other-versions.jar
         curl -fsSL \
-          https://github.com/OptimCE/optimce-keycloak-theme/releases/download/v0.0.3/keycloak-theme-for-kc-all-other-versions.jar \
+          https://github.com/OptimCE/optimce-keycloak-theme/releases/download/v0.0.4/keycloak-theme-for-kc-all-other-versions.jar \
           -o "$$WORK/src.jar"
         mkdir -p "$$WORK/unpacked"
         cd "$$WORK/unpacked"
