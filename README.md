@@ -73,6 +73,7 @@ them into their final form (`prod-config.json`, `config.json`,
 | minio | S3-compatible storage | internal |
 | nats | JetStream message broker | internal |
 | redis | Realtime (SSE) ticket store and pub/sub bus | internal |
+| best-address | Self-hosted BeSt Address register (FPS BOSA) — the address picker. ~1.7 GB RAM | internal |
 | reverse-proxy | NGINX reverse proxy | http://localhost |
 
 ## Commands
@@ -103,7 +104,7 @@ Docker Compose profiles control which services start:
 | Profile | Services | Purpose |
 |---------|----------|---------|
 | `init` | swagger-doc-gen, generation-doc-gen, simulation-doc-gen, news-board-doc-gen, billing-doc-gen, administrative-document-doc-gen, krakend-config, keycloak-config, nginx-config, crm-frontend-config, keycloak-group-id-mapper, keycloak-optimce-theme | One-shot config generators and provider downloads |
-| `backend` | postgres, postgres-init, keycloak-db, keycloak, keycloak-healthcheck, crm-backend, allocation-key-generation (+ worker), simulation-key (+ worker), news-board, billing (+ worker), administrative-document (+ worker), document-generation, notification-dispatch, nats, redis, minio, minio-init, krakend | Core infrastructure |
+| `backend` | postgres, postgres-init, keycloak-db, keycloak, keycloak-healthcheck, crm-backend, allocation-key-generation (+ worker), simulation-key (+ worker), news-board, billing (+ worker), administrative-document (+ worker), document-generation, notification-dispatch, nats, redis, best-address, minio, minio-init, krakend | Core infrastructure |
 | `frontend` | reverse-proxy, certbot, crm-frontend | Web serving layer |
 | `migration` | optimce-migrator | One-shot schema migrations, all six databases |
 | `backup` | db-backup, keycloak-db-backup | Database backup services |
@@ -213,6 +214,22 @@ The map views (meters as pins, communities as commune zones) need coordinates on
 `address`, which arrive as a CRM migration — not from this repo. `GEOCODING_MODE` ships
 `LOCAL`, which never leaves the process; `REMOTE` additionally allows two free Belgian
 public geocoders and is reachable only from the admin-only `POST /geocoding/backfill`.
+
+The **address picker** is a third source and a different shape: `best-address` is the
+federal BeSt Address register run here as our own container, so it is the one address
+lookup allowed on the inline write path — which is what upgrades a new meter's pin from
+the commune centre to its actual roof. Two things to know before the first deploy:
+
+- **It costs ~1.7 GB resident.** The address file is baked into the image, so the image
+  reference *is* the dataset version (`YYYY-WW`, the ISO week of the extract) and a
+  `docker pull` is the data refresh. `.github/renovate.json` carries the versioning rule
+  that keeps that refresh arriving; without it Renovate misreads the tag and the register
+  freezes at whatever week was pinned.
+- **Blanking `BEST_ADDRESS_URL` is the off switch — deleting the line is not.** Blank,
+  the suggester is unbound and `GET /geocoding/suggest` answers `[]` rather than
+  erroring. That silence is also how a broken deployment hides, so check
+  `docker compose ps best-address` before believing the picker itself is at fault.
+  Nothing gates on it: the API starts, and works, whether or not the register is up.
 
 Full procedures: [`docs/runbooks/realtime-sse.md`](docs/runbooks/realtime-sse.md) and
 [`docs/runbooks/map-views.md`](docs/runbooks/map-views.md).

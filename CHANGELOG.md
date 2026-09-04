@@ -59,7 +59,86 @@ and this project adheres to
   inline on the service, because this deployment's `nginx-config` reads its
   upstreams through `env_file`.
 
+### Added (the BeSt Address picker)
+
+- **`best-address`** — the federal BeSt Address register (FPS BOSA), self-hosted in
+  the `backend` profile on a new `best-address` network that `crm-backend` is the
+  only member of. It backs the address picker (`GET /geocoding/suggest`) and the
+  rooftop-precision pin a new meter gets at write time. Unlike the two regional
+  geocoders this one is ours and on our own network, which is what makes it the one
+  address lookup allowed on the inline write path.
+  - **It costs ~1.7 GB resident**, on top of everything this host already runs.
+    Confirm the headroom before the window. If it will not fit, blank
+    `BEST_ADDRESS_URL` and set `GEOCODING_MODE=REMOTE` — you lose the picker, not
+    the map.
+  - **Digest-pinned, because the image *is* the dataset.** The address file is baked
+    in and tagged `YYYY-WW` for the ISO week of the extract, so a `docker pull` is
+    the data refresh and an unpinned tag means two hosts can silently sit weeks
+    apart. Pinned to `2026-35@sha256:3711…`, byte-identical to the monorepo's pin.
+  - Its healthcheck runs a **real `/addresses` query, with `curl`**. Not `/health`:
+    the first read after a cold start measured **56 seconds** while Postgres pages
+    the address table in, against 0.09 s once warm, and KrakenD's cap is 3000 ms —
+    so a box answering `/health` is not ready in any useful sense. And not `wget`:
+    the image does not ship one, so a `wget` probe can never pass and would leave
+    the container permanently `unhealthy` while working perfectly.
+  - **No `depends_on` from `crm-backend`.** Gating the whole CRM API on a ~45 s
+    warm-up, to protect a feature that degrades to "no suggestions" on its own, is
+    the wrong trade. The cost is that a `best-address` that never comes up is
+    invisible unless you look.
+  - `PGOPTIONS` must stay unset. The image splices it **unquoted** into
+    `pg_ctl start -D $PGDATA $PGOPTIONS`, so a value becomes raw `pg_ctl` arguments
+    and the container crash-loops in silence.
+  - Attribution is required — the data is CC-BY 4.0: *Service public de Wallonie*,
+    *Paradigm.Brussels*, *Digitaal Vlaanderen*.
+- `BEST_ADDRESS_URL` and `BEST_ADDRESS_TIMEOUT_MS` on `crm-backend`, and in
+  `docker-compose/.env.example`. The URL uses compose's `-` form, not `:-`, so it
+  fills in only when the variable is **unset**: **blanking the value is the off
+  switch, deleting the line is not.** Blank, the suggester is unbound and
+  `GET /geocoding/suggest` answers `[]` rather than erroring — which is also how a
+  misconfiguration hides, so check `docker compose ps best-address` before believing
+  the picker is broken.
+- **`.github/renovate.json`** — this repo had no `.github/` at all. It mirrors the
+  monorepo's config (`config:recommended`, `group:allNonMajor`, `docker:pinDigests`)
+  plus one rule that exists solely for the register: Renovate's default docker
+  versioning reads `2026-35` as major 2026 with compatibility suffix 35 and would
+  then only ever look for another `-35` tag, so **the weekly address refresh would
+  silently never be offered** and the register would freeze at whatever week was
+  pinned the day this landed.
+- `docs/runbooks/map-views.md` §1b and §1c, plus four troubleshooting rows — the
+  silent-picker case, the `wget` probe, the `PGOPTIONS` crash-loop, and address
+  writes 500ing on a missing migration 11.
+
 ### Added (migrations)
+
+- **CRM migration 11 — house numbers become text, plus the BeSt link.**
+  `address.number` widens from `INT` to `VARCHAR(32)` (a Belgian house number is
+  `12A`, not 12 — the register returns `12-14`, `1/3`, `2/0001`), and `country`
+  (ISO-3166-1 alpha-2, default `BE`) and `best_address_id` are added, with
+  `chk_address_number_not_blank`, `chk_address_country`, the partial
+  `idx_address_best_id`, and `idx_address_dedup` on `(postcode, street, number)` —
+  which `addAddress` had been scanning sequentially on every write.
+  - **Deploy the crm-backend image BEFORE running the migrator. This is the one
+    ordering the migration cannot enforce for itself.** `address.number` is read
+    through the `houseNumberToString` transformer, so the API emits a string
+    whether the column is `int` or `varchar` — but only once that build is live.
+    Applied first, it flips the wire type of every address response underneath a
+    frontend that was not deployed for it. `DEPLOYMENT_PLAN.md` Step 6b → Step 7 is
+    already in that order; `DATABASE_CONSOLIDATION.md` §0.0 is not, and its new
+    §9.12 says what to move.
+  - The type change is a **full table rewrite under `ACCESS EXCLUSIVE`** —
+    sub-second at this volume, but a maintenance-window operation, not an online
+    one.
+  - **A green `./docker-stack.sh verify` is not evidence this landed.** It creates
+    no relation, and a table-level `GRANT SELECT` already covers new columns, so
+    every assertion would be green either way. Use `\d address`.
+- `docker-compose/schemas/crm_db.sql` re-vendored from the monorepo, carrying the
+  same address block. **Inert for the running deployment** — `postgres-init` applies
+  a baseline only to a database with no relations — but it is what stops a
+  rebuild-from-empty landing one migration short, permanently and with no way to
+  notice.
+- `docker-compose/krakend_config/administrative-document.json` added to
+  `.gitignore`. It is generated by `administrative-document-doc-gen` like its five
+  siblings, which were already ignored; it alone showed up as untracked noise.
 
 - **`./docker-stack.sh migrate`** (and `docker-stack.bat migrate`), with
   `--dry-run` and `--no-pull`. It pulls `optimce-migrator`, runs it, and **always**

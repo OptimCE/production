@@ -393,6 +393,70 @@ services:
       retries: 5
       start_period: 10s
 
+  # The federal BeSt Address register (FPS BOSA), self-hosted.
+  #
+  # It backs two things: the address picker (`GET /geocoding/suggest`) and the
+  # rooftop-precision pin a new meter gets at write time. Unlike the two regional
+  # geocoders it is OURS, on a network of this deployment's own, which is what
+  # makes it the one address lookup allowed on the inline write path.
+  #
+  # BUDGET FOR IT BEFORE THE FIRST START: the image is 1.6 GB and the container
+  # settles around 1.7 GB resident. That is a real line item on a VPS. If the
+  # host cannot spare it, blank BEST_ADDRESS_URL and set GEOCODING_MODE=REMOTE -
+  # you lose the picker, not the map. See docs/runbooks/map-views.md.
+  #
+  # The data is baked into the image, so the image reference IS the dataset
+  # version - `YYYY-WW` for the ISO week of the extract. Digest-pinned like
+  # postgres, redis and keycloak, and .github/renovate.json carries the versioning
+  # rule that teaches Renovate to read those tags; without that rule the weekly
+  # address refresh would silently never be offered and the register would freeze
+  # at whatever week was pinned the day this landed.
+  #
+  # Licence: the address data is CC-BY 4.0. Attribution is required - Service
+  # public de Wallonie, Paradigm.Brussels, Digitaal Vlaanderen. It belongs beside
+  # the picker in the UI, not in the basemap attribution.
+  #
+  # No published port. The development stack binds 127.0.0.1:8096 for its curl
+  # recipes; here the equivalent is `docker compose exec`.
+  best-address:
+    profiles: ["backend"]
+    # 2026-35 = the ISO week-35 2026 extract, published 2026-08-31. Kept
+    # byte-identical to the monorepo's pin so development and production resolve
+    # the same addresses; Renovate moves both.
+    image: bosa/opendata-best-webapi:2026-35@sha256:371165f3e370e3d8476202bacea4c74bcbc8a02f944671b968826bcd64b6cf18
+    restart: unless-stopped
+    environment:
+      - SERVER_PORT=8080
+      # Do NOT set PGOPTIONS here. The image's CMD is
+      #   pg_ctl start -D $$PGDATA $$PGOPTIONS && java -jar best-webapi.jar
+      # with the variable UNQUOTED, so the value is word-split into raw pg_ctl
+      # arguments - not server settings. `-c shared_buffers=512MB` makes pg_ctl
+      # exit with "too many command-line arguments" and, with restart:
+      # unless-stopped and nothing depending on this service, the container then
+      # crash-loops in silence. The image's own defaults are fine.
+    networks:
+      - best-address
+    healthcheck:
+      # NOT just /health. The first /addresses read after a cold start took 56
+      # SECONDS (Postgres paging the address table in) against 0.09 s once warm,
+      # and KrakenD's global timeout is 3000 ms - so a box that answers /health
+      # but has never touched the address table is not ready in any useful sense,
+      # and the first person to type an address would get a 504.
+      #
+      # curl, not wget: this image has no wget, and a probe that can never pass
+      # leaves the container `starting` forever and then permanently unhealthy,
+      # while the service underneath works perfectly. --max-time stays under the
+      # `timeout` below so curl gives up before Docker kills it.
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS --max-time 85 -o /dev/null 'http://localhost:8080/belgianAddress/v2/addresses?postCode=1000&page=1'",
+        ]
+      interval: 30s
+      timeout: 90s
+      retries: 5
+      start_period: 120s
+
   keycloak:
     profiles: ["backend"]
     image: quay.io/keycloak/keycloak:26.5.5@sha256:a7b0cb7a43a1235a61872883414d3f1d9a3ceac9df6e5907bd12202778a6265c
@@ -603,6 +667,19 @@ services:
       - GEOCODING_FLANDERS_URL=${GEOCODING_FLANDERS_URL:-}
       - GEOCODING_TIMEOUT_MS=${GEOCODING_TIMEOUT_MS:-2000}
       - GEOCODING_BATCH_MAX=${GEOCODING_BATCH_MAX:-1000}
+      # ---- The BeSt Address register (address picker) --------------------
+      # The `-` form, NOT `:-`. It fills in only when the variable is UNSET,
+      # which is what lets a deliberately BLANK value in .env stay the off
+      # switch: with no URL the suggester is unbound, GET /geocoding/suggest
+      # answers `[]` rather than erroring, and every address form behaves as it
+      # did before the feature existed. Deleting the line does NOT turn it off.
+      #
+      # There is deliberately no `depends_on: best-address`. Its healthcheck
+      # waits for the address table to be paged in (~45 s cold), and gating the
+      # whole CRM API on that - to protect a feature that degrades to "no
+      # suggestions" on its own - is the wrong trade.
+      - BEST_ADDRESS_URL=${BEST_ADDRESS_URL-http://best-address:8080/belgianAddress/v2}
+      - BEST_ADDRESS_TIMEOUT_MS=${BEST_ADDRESS_TIMEOUT_MS:-1500}
     volumes:
       - ./reference:/app/reference:ro
     networks:
@@ -613,6 +690,9 @@ services:
       - minio
       - opentelemetry
       - redis
+      # crm-backend is the ONLY member of this network - see the `best-address`
+      # comment at the bottom of this file.
+      - best-address
       # For `location = ${WEB_REALTIME_PATH}` only - see the `sse` network
       # comment at the bottom of this file.
       - sse
@@ -1448,6 +1528,12 @@ networks:
   # file read access to every in-flight ticket. Here, joining is an opt-in that
   # shows up in review.
   redis:
+  # The self-hosted BeSt Address register. crm-backend is the only member, and
+  # that is the whole point: this box carries the federal address file with no
+  # authentication of its own, so reaching it is the privilege being granted.
+  # Naming a network rather than reusing `crm` - which ten services already share
+  # - keeps that grant an opt-in that shows up in review.
+  best-address:
   # reverse-proxy <-> crm-backend, for `location = ${WEB_REALTIME_PATH}` - the one
   # path that bypasses the API gateway.
   #
