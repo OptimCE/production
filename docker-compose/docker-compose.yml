@@ -403,7 +403,7 @@ services:
   # BUDGET FOR IT BEFORE THE FIRST START: the image is 1.6 GB and the container
   # settles around 1.7 GB resident. That is a real line item on a VPS. If the
   # host cannot spare it, blank BEST_ADDRESS_URL and set GEOCODING_MODE=REMOTE -
-  # you lose the picker, not the map. See docs/runbooks/map-views.md.
+  # you lose the picker, not the map.
   #
   # The data is baked into the image, so the image reference IS the dataset
   # version - `YYYY-WW` for the ISO week of the extract. Digest-pinned like
@@ -636,8 +636,8 @@ services:
       # With REALTIME_ENABLED=false nothing is bound, no Redis connection is
       # opened, the ticket endpoint 503s and the SPA sits in polling - byte for
       # byte the behaviour that predates this feature. That is the rollout AND
-      # the rollback. It ships false; flip it after the smoke test in
-      # docs/runbooks/realtime-sse.md.
+      # the rollback. It ships false; flip it once the nginx location, the Redis
+      # auth and the producer images have been verified.
       - REALTIME_ENABLED=${REALTIME_ENABLED:-false}
       - REALTIME_REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/1
       # Every knob below has a coded default in config/production.cjs. They are
@@ -1266,7 +1266,7 @@ services:
   #
   # REQUIRES a CRM schema carrying notification / outbound_message /
   # email_suppression / notification_preference. Those arrive via the migration
-  # profile, not from this repo — see DATABASE_CONSOLIDATION.md.
+  # profile, not from this repo.
   notification-dispatch:
     profiles: ["backend"]
     image: ghcr.io/optimce/notification-dispatch:main-worker
@@ -1328,7 +1328,7 @@ services:
   #
   # If a migrator release ever genuinely needs superuser, run it as `postgres`
   # and then repair with postgres/provision/91-reown-crm.sql followed by another
-  # postgres-init run. See DATABASE_CONSOLIDATION.md.
+  # postgres-init run.
   optimce-migrator:
     profiles: ["migration"]
     image: ghcr.io/optimce/migrator:main
@@ -1484,7 +1484,6 @@ volumes:
   # While the rollback window is open, do NOT run `docker compose down -v` and do
   # NOT run `docker volume prune`. Remove these declarations in a follow-up
   # commit once the window closes and the volumes have had a final snapshot.
-  # See DATABASE_CONSOLIDATION.md §8.
   # ---------------------------------------------------------------------------
   crm_db_data:
   allocation_key_db_data:
@@ -1546,5 +1545,5 @@ networks:
   # The property that IS enforced: crm-frontend is on `reverse-proxy` ONLY, and
   # crm-backend is not on `reverse-proxy`. crm-backend authenticates nothing - it
   # trusts x-user-id blindly - so a compromised static frontend must never be able
-  # to resolve it. See docs/runbooks/realtime-sse.md for the DNS probe.
+  # to resolve it.
   sse:

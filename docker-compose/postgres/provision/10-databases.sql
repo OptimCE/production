@@ -12,8 +12,8 @@
 --
 -- LOCALE NOTE. The CREATE DATABASE below is bare, so every database inherits
 -- template1's encoding, collation and locale provider. That is correct only
--- while the source instances all match. DATABASE_CONSOLIDATION.md §0.2 captures
--- them before the migration; if they differ, add explicit ENCODING /
+-- while the source instances all match. Capture all three on every source
+-- instance before migrating; if they differ, add explicit ENCODING /
 -- LC_COLLATE / LC_CTYPE / LOCALE_PROVIDER here BEFORE the first run. A
 -- collation mismatch does not error — it silently changes index ordering and
 -- the result of every range scan and ORDER BY.

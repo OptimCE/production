@@ -150,10 +150,6 @@ databanken, eigendom en rechten te laten convergeren — zie
 ./docker-stack.sh verify   # de isolatie en de CRM-rechtenmatrix aantonen
 ```
 
-Het migreren van een bestaande opstelling met aparte instanties naar deze indeling
-staat beschreven in
-[DATABASE_CONSOLIDATION.md](../DATABASE_CONSOLIDATION.md).
-
 ## Automatische back-ups
 
 Back-ups draaien automatisch vóór `stop` of `restart`. `db-backup` dumpt alle

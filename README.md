@@ -169,9 +169,6 @@ roles, passwords, databases, ownership and grants — see
 ./docker-stack.sh verify   # prove the isolation and the CRM grant matrix
 ```
 
-Migrating an existing split-instance deployment into this layout is documented in
-[DATABASE_CONSOLIDATION.md](DATABASE_CONSOLIDATION.md).
-
 ## Realtime (SSE) and maps
 
 The notification bell and the module dashboards can be pushed to rather than polled.
@@ -230,9 +227,6 @@ the commune centre to its actual roof. Two things to know before the first deplo
   erroring. That silence is also how a broken deployment hides, so check
   `docker compose ps best-address` before believing the picker itself is at fault.
   Nothing gates on it: the API starts, and works, whether or not the register is up.
-
-Full procedures: [`docs/runbooks/realtime-sse.md`](docs/runbooks/realtime-sse.md) and
-[`docs/runbooks/map-views.md`](docs/runbooks/map-views.md).
 
 ## Automatic Backups
 

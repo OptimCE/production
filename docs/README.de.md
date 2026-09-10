@@ -151,10 +151,6 @@ Rollen, Passwörter, Datenbanken, Eigentum und Rechte zu konvergieren — siehe
 ./docker-stack.sh verify   # Isolation und CRM-Rechtematrix nachweisen
 ```
 
-Die Migration einer bestehenden Bereitstellung mit getrennten Instanzen in dieses
-Layout beschreibt
-[DATABASE_CONSOLIDATION.md](../DATABASE_CONSOLIDATION.md).
-
 ## Automatische Sicherungen
 
 Sicherungen laufen automatisch vor `stop` oder `restart`. `db-backup` sichert alle

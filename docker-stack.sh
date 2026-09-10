@@ -214,7 +214,8 @@ migrate_stack() {
     if [ "$status" -ne 0 ]; then
         echo
         echo "Migration FAILED (exit ${status}). Grants were converged over what landed."
-        echo "See DATABASE_CONSOLIDATION.md 9.1 before retrying."
+        echo "Each migration commits separately - check schema_version in each"
+        echo "database before retrying."
         exit "$status"
     fi
 

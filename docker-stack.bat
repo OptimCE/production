@@ -248,7 +248,8 @@ echo Re-converging grants over whatever the migrator created...
 if "%MIGRATE_STATUS%"=="1" (
     echo.
     echo Migration FAILED. Grants were converged over what landed.
-    echo See DATABASE_CONSOLIDATION.md 9.1 before retrying.
+    echo Each migration commits separately - check schema_version in each
+    echo database before retrying.
     exit /b 1
 )
 echo.

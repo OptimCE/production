@@ -84,9 +84,8 @@ database. Two mechanisms would also be two things that can diverge.
 `provision.sh` applies `/seeds/<db>/*.sql` on every run, which is right for
 development and wrong for production: what a database contains should be a
 function of its migration history, not of how many times it has been restarted.
-Reference data ships as a migration like every other change — see
-[DATABASE_CONSOLIDATION.md](../../DATABASE_CONSOLIDATION.md) §9.8. That missing
-block is the one intentional behavioural difference between the two copies of the
+Reference data ships as a migration like every other change. That missing block
+is the one intentional behavioural difference between the two copies of the
 script.
 
 `set -eu` plus `ON_ERROR_STOP=1` on every `psql` means a failure exits the
@@ -176,9 +175,7 @@ and appears in `10-databases.sql` only in the `crm_db` `GRANT CONNECT` list.
 
 If the service ships **reference data**, it does not go here. Seeds are not a
 mechanism in this deployment: reference data is applied once, as a migration, and
-recorded in that database's `schema_version`. See
-[DATABASE_CONSOLIDATION.md](../../DATABASE_CONSOLIDATION.md) §9.8 for how, and why
-the monorepo does it differently.
+recorded in that database's `schema_version`.
 
 ## Why Keycloak is not here
 

@@ -8,8 +8,7 @@
 # nor reach a second database. Two mechanisms would also be two things that can
 # diverge — see postgres/README.md.
 #
-# The MIGRATION reuses this file UNCHANGED, in two passes. See
-# DATABASE_CONSOLIDATION.md:
+# The MIGRATION reuses this file UNCHANGED, in two passes:
 #     pass 1, before pg_restore:  SKIP_SCHEMAS=1 sh provision.sh
 #     pass 2, after pg_restore:   sh provision.sh
 #
@@ -149,8 +148,7 @@ while IFS='|' read -r db owner schema; do
     # In production, anything that changes a database is applied ONCE and
     # recorded, so that what a database contains is a function of its migration
     # history and not of how many times it has been restarted. Reference data is
-    # no exception: it ships as a migration, like every other change. See
-    # DATABASE_CONSOLIDATION.md §9.8.
+    # no exception: it ships as a migration, like every other change.
     #
     # If you are diffing this file against the monorepo's, that missing block is
     # the one intentional behavioural difference between them.

@@ -151,10 +151,6 @@ converger rôles, mots de passe, bases, propriété et droits — voir
 ./docker-stack.sh verify   # prouver l'isolation et la matrice de droits CRM
 ```
 
-La migration d'un déploiement existant à instances séparées vers cette
-architecture est décrite dans
-[DATABASE_CONSOLIDATION.md](../DATABASE_CONSOLIDATION.md).
-
 ## Sauvegardes automatiques
 
 Les sauvegardes s'exécutent automatiquement avant `stop` ou `restart`. `db-backup`
