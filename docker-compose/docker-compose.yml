@@ -654,10 +654,11 @@ services:
       # ---- Address geocoding (map views) ---------------------------------
       # LOCAL = pin drops plus the municipality centroid already stored in
       # municipality.geo_point; no network call, ever. REMOTE additionally allows
-      # the two free Belgian public geocoders, and ONLY from the admin-only
-      # POST /geocoding/backfill. The inline chain on POST /meters stays local
-      # regardless - KrakenD's global timeout is 3000ms with no per-endpoint
-      # override, so a third-party call there is a 504 waiting to happen.
+      # the two free Belgian public geocoders, and ONLY from POST /geocoding/backfill,
+      # which only the operators in GEOCODING_BACKFILL_OPERATORS may run. The inline
+      # chain on POST /meters stays local regardless - KrakenD's global timeout is
+      # 3000ms with no per-endpoint override, so a third-party call there is a 504
+      # waiting to happen.
       #
       # The two URLs are left empty on purpose: production.cjs falls back with
       # `|| "https://..."` and an empty string is falsy, so unset means "use the
@@ -667,6 +668,18 @@ services:
       - GEOCODING_FLANDERS_URL=${GEOCODING_FLANDERS_URL:-}
       - GEOCODING_TIMEOUT_MS=${GEOCODING_TIMEOUT_MS:-2000}
       - GEOCODING_BATCH_MAX=${GEOCODING_BATCH_MAX:-1000}
+      # Keycloak user ids allowed to run POST /geocoding/backfill; empty = nobody.
+      - GEOCODING_BACKFILL_OPERATORS=${GEOCODING_BACKFILL_OPERATORS:-}
+      # ---- Annex catalogue switches --------------------------------------
+      # config/annexes-services.json is baked into the image and shared by every
+      # deployment. An entry that ships "defaultEnabled": false stays hidden until
+      # named in ENABLE (live-data ships that way, and its service does not run
+      # here); DISABLE hides an entry and wins over ENABLE. Comma-separated feature
+      # names, empty = none. A name the image's catalogue does not contain REFUSES
+      # THE BOOT - a restart loop logging annexes_services:catalog_overrides. The
+      # set actually served is logged once at boot as annexes_services:catalog_loaded.
+      - ANNEX_CATALOG_ENABLE=${ANNEX_CATALOG_ENABLE:-}
+      - ANNEX_CATALOG_DISABLE=${ANNEX_CATALOG_DISABLE:-}
       # ---- The BeSt Address register (address picker) --------------------
       # The `-` form, NOT `:-`. It fills in only when the variable is UNSET,
       # which is what lets a deliberately BLANK value in .env stay the off

@@ -24,32 +24,41 @@ goto :collect_args
 call :resolve_compose_cmd
 if errorlevel 1 exit /b 1
 
+rem Every branch returns !errorlevel!, never %errorlevel%. Inside a parenthesised
+rem block %errorlevel% is expanded when the block is PARSED, before its `call`
+rem runs, so it held the value from before the command and every command
+rem exited 0 even when it had failed. survey-ean answers 0/1/2, and that code is
+rem its whole answer.
 if /i "%COMMAND%"=="start" (
     call :parse_start_options !REST!
     if errorlevel 1 exit /b 1
     call :start_stack
-    exit /b %errorlevel%
+    exit /b !errorlevel!
 )
 if /i "%COMMAND%"=="stop" (
     call :stop_stack
-    exit /b %errorlevel%
+    exit /b !errorlevel!
 )
 if /i "%COMMAND%"=="restart" (
     call :parse_start_options !REST!
     if errorlevel 1 exit /b 1
     call :stop_stack
     call :start_stack
-    exit /b %errorlevel%
+    exit /b !errorlevel!
 )
 if /i "%COMMAND%"=="migrate" (
     call :parse_migrate_options !REST!
     if errorlevel 1 exit /b 1
     call :migrate_stack
-    exit /b %errorlevel%
+    exit /b !errorlevel!
 )
 if /i "%COMMAND%"=="verify" (
     call :verify_stack
-    exit /b %errorlevel%
+    exit /b !errorlevel!
+)
+if /i "%COMMAND%"=="survey-ean" (
+    call :survey_ean
+    exit /b !errorlevel!
 )
 if /i "%COMMAND%"=="help" goto :usage
 if /i "%COMMAND%"=="-h" goto :usage
@@ -67,6 +76,7 @@ echo   stop       Stop init, backend, and frontend profiles
 echo   restart    Stop then start
 echo   migrate    Apply pending database migrations, then re-converge the grants
 echo   verify     Prove the database isolation and the CRM grant matrix
+echo   survey-ean Report every stored EAN that is not 18 digits (read-only)
 echo   help       Show this help message
 echo.
 echo Options (for start/restart):
@@ -207,6 +217,16 @@ if "%VERIFY_STATUS%"=="1" (
 echo.
 echo Verification passed.
 exit /b 0
+
+:survey_ean
+rem Read-only: every statement in the script is a SELECT. Run it BEFORE migrate
+rem whenever the migrator carries CRM migration 12, which refuses to add the
+rem meter.ean CHECK while any row is not 18 digits. The exit code is the
+rem script's own: 0 clean, 1 non-conforming meter.ean rows, 2 a probe could
+rem not run. Deliberately not part of verify, which one legacy row must not
+rem turn red.
+%DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --profile backend --env-file "%ENV_FILE%" run --rm --no-deps --entrypoint sh postgres-init /postgres/verify/ean-survey.sh
+exit /b %errorlevel%
 
 :migrate_stack
 rem The migrator is in the `migration` profile but depends_on postgres and

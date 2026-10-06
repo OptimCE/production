@@ -18,6 +18,7 @@ Commands:
     restart    Stop then start
     migrate    Apply pending database migrations, then re-converge the grants
     verify     Prove the database isolation and the CRM grant matrix
+    survey-ean Report every stored EAN that is not 18 digits (read-only)
     help       Show this help message
 
 Options (for start/restart):
@@ -172,6 +173,21 @@ verify_stack() {
     echo "Verification passed."
 }
 
+survey_ean() {
+    # Read-only: every statement in the script is a SELECT. Same container, and
+    # the same MSYS_NO_PATHCONV and `--entrypoint sh` reasoning, as verify_stack.
+    #
+    # Run it BEFORE `migrate` whenever the migrator carries CRM migration 12: that
+    # migration refuses to add the meter.ean CHECK while any row is not 18 digits.
+    # The exit status is the script's own - 0 clean, 1 non-conforming meter.ean
+    # rows, 2 a probe could not run - and `set -e` hands it straight back.
+    #
+    # Deliberately NOT part of `verify`: that is a pass/fail proof of isolation
+    # and grants, and one legacy row must not turn it red.
+    MSYS_NO_PATHCONV=1 compose -f "$COMPOSE_FILE" --profile backend --env-file "$ENV_FILE" \
+        run --rm --no-deps --entrypoint sh postgres-init /postgres/verify/ean-survey.sh
+}
+
 migrate_stack() {
     # The migrator is in the `migration` profile but depends_on postgres and
     # postgres-init, which are in `backend` - so BOTH profiles must be active or
@@ -298,6 +314,9 @@ main() {
             ;;
         verify)
             verify_stack
+            ;;
+        survey-ean)
+            survey_ean
             ;;
         help|-h|--help)
             usage

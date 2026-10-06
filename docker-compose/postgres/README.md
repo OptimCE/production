@@ -133,6 +133,26 @@ it. The annexes wrap their `audit_log` INSERT in a SAVEPOINT under a blanket
 `except Exception`, so a missing grant returns 200 to the caller and silently
 drops the audit row.
 
+## Survey before a constraint
+
+```bash
+./docker-stack.sh survey-ean
+```
+
+`verify/ean-survey.sh` reports every stored EAN that is not exactly 18 digits.
+Read-only (every statement is a SELECT), and it runs as the **superuser**, unlike
+the two scripts above: the isolation they prove means no service role can read
+across databases, and a survey needs to. Exit 0 = clean, 1 = `crm_db.meter.ean`
+has non-conforming rows (listed, with samples), 2 = a probe could not run. Every
+probe is guarded on its database and table existing, so `live_data_local`, which
+this deployment does not run, is simply skipped.
+
+Run it before the migrator applies CRM migration 12, which adds
+`chk_meter_ean_18_digits` and **refuses** to while any `meter.ean` does not
+conform. It is deliberately not part of `verify`: that is a pass/fail proof of
+isolation and grants, and one legacy row must not turn it red. Ported unchanged
+from the monorepo's `postgres/verify/ean-survey.sh`.
+
 ## Rotating a password
 
 Edit the variable in `docker-compose/.env`, then `./docker-stack.sh restart` —

@@ -51,7 +51,10 @@ and this project adheres to
   bearer token, so an interceptor attaching one would be misleading.
 - The `GEOCODING_*` block on `crm-backend`, shipping `GEOCODING_MODE=LOCAL`.
   REMOTE is outbound traffic to two third-party geocoders carrying member address
-  strings, and is reached only from the admin-only `POST /geocoding/backfill`.
+  strings, and is reached only from `POST /geocoding/backfill`, which is limited to
+  the Keycloak user ids in the new `GEOCODING_BACKFILL_OPERATORS` (empty = nobody):
+  the backfill geocodes every community's addresses, and any user can create a
+  community and become its ADMIN.
 - `WEB_REALTIME_PATH`, `WEB_MAP_STYLE_URL`, `CRM_BACKEND_UPSTREAM`,
   `CRM_BACKEND_PROTOCOL`, the `REALTIME_*` ceilings and the `GEOCODING_*` block in
   `docker-compose/.env.example`. The upstream pair lives in `.env` rather than
@@ -127,8 +130,20 @@ and this project adheres to
   - **A green `./docker-stack.sh verify` is not evidence this landed.** It creates
     no relation, and a table-level `GRANT SELECT` already covers new columns, so
     every assertion would be green either way. Use `\d address`.
+- **CRM migration 12 — `meter.ean` must be exactly 18 digits.** Adds
+  `chk_meter_ean_18_digits`, but only after a guard has counted the rows that do not
+  conform: if there are any it raises, the runner rolls the file and its
+  `schema_version` row back together, and the CRM stays at 11 with nothing
+  half-applied. **Expect that here** — the deployed crm-frontend enforced a 13-digit
+  rule from 2026-06-08 until this release. A refusal blocks nothing: 11 is what the
+  new crm-backend needs, and it already rejects a non-18-digit EAN on `POST /meters`.
+  Online-safe (one scan of `meter` under a 5-second `lock_timeout`). Never get past it
+  with `NOT VALID`: the offending meters would become read-only, and nothing can
+  rewrite a meter's EAN. See `DEPLOYMENT_PLAN.md` Step 7 and
+  `DATABASE_CONSOLIDATION.md` §9.13.
 - `docker-compose/schemas/crm_db.sql` re-vendored from the monorepo, carrying the
-  same address block. **Inert for the running deployment** — `postgres-init` applies
+  same address block and, since migration 12, `chk_meter_ean_18_digits` on `meter`.
+  **Inert for the running deployment** — `postgres-init` applies
   a baseline only to a database with no relations — but it is what stops a
   rebuild-from-empty landing one migration short, permanently and with no way to
   notice.
@@ -145,6 +160,12 @@ and this project adheres to
   re-runs `postgres-init` afterwards — including after a failure, because each
   migration commits in its own transaction and tables that landed arrive
   ungranted, which is silent at runtime rather than loud.
+- **`./docker-stack.sh survey-ean`** (and `docker-stack.bat survey-ean`), running
+  `docker-compose/postgres/verify/ean-survey.sh`, ported unchanged from the monorepo:
+  a read-only report of every stored EAN that is not 18 digits, as the superuser
+  because it reads across databases. Exit 0 clean, 1 `meter.ean` offenders (listed,
+  with samples), 2 a probe could not run. Run it before migration 12. Deliberately
+  not part of `verify`, which one legacy row must not turn red.
 - **`optimce-migrator` now receives six database URLs, not three.** The image has
   grown `migrations/allocation-key`, `migrations/simulation-key` and
   `migrations/news-board`. `allocation_key_local` and `simulation_key_local` each
@@ -161,8 +182,29 @@ and this project adheres to
     `NEWS_BOARD_DB_PASSWORD` are now consumed twice: by their own service, and by
     the migrator connecting as the same owning role. No new secret.
 
+### Added (annex catalogue switches)
+
+- **`ANNEX_CATALOG_ENABLE` / `ANNEX_CATALOG_DISABLE`** on `crm-backend`, both empty.
+  The annex catalogue is baked into the crm-backend image and shared by every
+  deployment; an entry that ships `"defaultEnabled": false` stays hidden until named
+  in ENABLE, and DISABLE hides an entry and wins over ENABLE. `live-data` ships that
+  way and its service does not run here, so the empty defaults are right. A name the
+  image's catalogue does not contain **refuses the boot**
+  (`annexes_services:catalog_overrides`); the set actually served is logged once at
+  boot as `annexes_services:catalog_loaded`. README's "Adding a new annex service"
+  gains the matching step.
+- `DATABASE_CONSOLIDATION.md` checks the served catalogue through that log line
+  instead of grepping `config/annexes-services.json`, which now also lists entries
+  that are switched off.
+
 ### Fixed
 
+- **`docker-stack.bat` reported success for every command, even a failed one.** Each
+  branch ended with `exit /b %errorlevel%` inside its `if ( … )` block, and cmd expands
+  `%errorlevel%` when it PARSES the block — before the `call` runs — so `verify`
+  printed "Verification FAILED" and exited 0, and so did a failed `migrate`, `start`,
+  `stop` and `restart`. A wrapper or CI step chaining them saw only successes. They
+  now return `!errorlevel!`; the shell script was never affected.
 - **Every upload larger than 1 MB was 413'd by nginx itself.** Neither template
   set `client_max_body_size`, so nginx's implicit 1 MB default applied — and the
   refusal is generated by nginx, as a bare HTML page that never reaches the app,

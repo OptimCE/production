@@ -86,6 +86,7 @@ them into their final form (`prod-config.json`, `config.json`,
 ./docker-stack.sh migrate         # Apply pending migrations, then re-converge grants
 ./docker-stack.sh migrate --dry-run  # Report what is pending, change nothing
 ./docker-stack.sh verify          # Prove database isolation and the CRM grants
+./docker-stack.sh survey-ean      # Report stored EANs that are not 18 digits (read-only)
 ./docker-stack.sh help            # Show usage
 ```
 
@@ -210,7 +211,8 @@ Two consequences worth knowing before the first deploy:
 The map views (meters as pins, communities as commune zones) need coordinates on
 `address`, which arrive as a CRM migration — not from this repo. `GEOCODING_MODE` ships
 `LOCAL`, which never leaves the process; `REMOTE` additionally allows two free Belgian
-public geocoders and is reachable only from the admin-only `POST /geocoding/backfill`.
+public geocoders and is reachable only from `POST /geocoding/backfill`, which only the
+operators listed in `GEOCODING_BACKFILL_OPERATORS` may run.
 
 The **address picker** is a third source and a different shape: `best-address` is the
 federal BeSt Address register run here as our own container, so it is the one address
@@ -322,6 +324,15 @@ regime inside the billing image, or `billing` will crash-loop on its startup par
 4. Extend `postgres/verify/isolation.sh` and `postgres/verify/positive-writes.sh`,
    or the new privilege boundary is undefended. `db-backup` picks the database up
    from its own loop — add it there too.
+5. Switch its catalogue entry on. The entry lives in crm-backend's
+   `config/annexes-services.json`, baked into the image every deployment shares, so it
+   ships `"defaultEnabled": false` until the service runs everywhere — an entry that is
+   on by default is offered to managers wherever the image runs, service or not. Opt in
+   here with `ANNEX_CATALOG_ENABLE=<feature>` in `.env`, then
+   `docker compose --profile backend up -d crm-backend`. Only name a feature the
+   image's catalogue contains: an unknown name refuses the boot
+   (`annexes_services:catalog_overrides` in the log). The set actually served is logged
+   once at boot as `annexes_services:catalog_loaded`.
 
 ## Contributing
 
