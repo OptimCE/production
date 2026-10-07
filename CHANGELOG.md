@@ -199,6 +199,34 @@ and this project adheres to
 
 ### Fixed
 
+- **A consumption import answered 500 although it had succeeded.** KrakenD gave
+  every endpoint 3000 ms, and `POST /sharing_operations/consumptions` routinely
+  needs more: a one-month, five-meter RESA file took ~3 s, a corrected one ~10 s.
+  The gateway answered `500 context deadline exceeded` while crm-backend went on
+  to commit, so the manager uploaded again, and an upload overlapping the
+  still-running one could store every reading twice. Billing refuses a period
+  with duplicated readings. `krakend-builder.yaml` now sets
+  `global.stream_timeout: 50s`. The generator applies it only to the 14
+  multipart-upload and file-download endpoints:
+  - uploads: consumption import, documents, community logo, allocation and
+    simulation key files, administrative-document versions;
+  - downloads: documents, key files, consumption and audit-log exports, invoice
+    PDFs.
+
+  Every other endpoint keeps 3000 ms, and 50 s stays under nginx's default 60 s
+  `proxy_read_timeout` on `/api/`.
+  - **It needs a `swagger2krakend` image built from d4a8f0a (2026-07-26) or
+    later.** The published `ghcr.io/optimce/swagger2krakend:main` is that
+    revision, but a host still holding an older pull ignores the key without a
+    word. Pull before the `init` profile runs (the default for `docker-stack.sh
+    start`, not with `--no-pull`). Then check `krakend_config/krakend.json`, not
+    the yaml: it must contain `"timeout": "50s"` 14 times.
+  - KrakenD reads the file only at startup, so recreate or restart `krakend`
+    after `krakend-config` has regenerated it. `docker-stack.sh restart` does
+    both.
+  - The other half of the fix ships with the crm-backend image, not with this
+    repo: the import itself (~1.3 s instead of ~3 s) and the per-community lock
+    that stops an overlapping re-upload from duplicating rows.
 - **`docker-stack.bat` reported success for every command, even a failed one.** Each
   branch ended with `exit /b %errorlevel%` inside its `if ( … )` block, and cmd expands
   `%errorlevel%` when it PARSES the block — before the `call` runs — so `verify`
