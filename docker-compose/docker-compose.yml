@@ -575,7 +575,14 @@ services:
 
   minio-init:
     profiles: ["backend"]
-    image: minio/mc:latest
+    # Pigsty's maintained `mc` build, the same source as the `minio` server image
+    # above. `minio/mc` (Docker Hub) and `quay.io/minio/mc` stopped serving
+    # anonymous pulls ("repository does not exist", checked 2026-10-07): a host
+    # still holding an old copy kept working, and the next `pull` failed — and
+    # with it every service gated on this job. The development stack has used
+    # pgsty/mc since 2026-04-22; same `mc` commands, `/bin/sh` present.
+    # Pinned by digest; Renovate (docker:pinDigests) keeps it moving.
+    image: pgsty/mc:latest@sha256:cfc83108c3abb371f8fb84d99c1fdc88f8c237e022409b0081fb7c0a3be634dd
     depends_on:
       minio:
         condition: service_healthy

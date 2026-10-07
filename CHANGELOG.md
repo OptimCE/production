@@ -244,6 +244,13 @@ and this project adheres to
 
 ### Fixed
 
+- **`minio-init` moved from `minio/mc` to `pgsty/mc`**, pinned by digest. `minio/mc`
+  on Docker Hub (and `quay.io/minio/mc`) no longer serves anonymous pulls
+  ("repository does not exist"), so every `docker compose pull` of the backend
+  profile failed — after `docker-stack.sh restart` had already stopped the stack.
+  A host that still held an old copy hid it. Same `mc` commands, same Pigsty
+  source as the `pgsty/minio` server image; the development stack switched on
+  2026-04-22.
 - **KrakenD pinned to 2.13.11, by digest.** `krakend:latest` became 3.0.0 on
   2026-09-30, and 3.x refuses the configuration swagger2krakend generates
   (`unsupported version: 3 (want: 4)`): the next `docker compose pull` would have left
