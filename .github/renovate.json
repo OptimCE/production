@@ -6,6 +6,18 @@
       "matchDatasources": ["docker"],
       "matchPackageNames": ["bosa/opendata-best-webapi"],
       "versioning": "regex:^(?<major>[0-9]{4})-(?<minor>[0-9]{1,2})$"
+    },
+    {
+      "description": "KrakenD 3.x refuses the configuration ghcr.io/optimce/swagger2krakend generates (\"unsupported version: 3 (want: 4)\"), so a 3.x bump would leave the gateway unable to start and every /api route down. Hold the 2.x line until a swagger2krakend release emits version 4, then remove this rule in the same change that moves the pin. Checked 2026-10-07 against 3.0.0.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["krakend"],
+      "allowedVersions": "<3.0.0"
+    },
+    {
+      "description": "eclipse-mosquitto is pinned to the 2.1 line because %u substitution in dynamic-security ACLs only exists from 2.1.0 (devices could publish nowhere on 2.0). Only the -alpine tags exist on that line. Allow patch and minor updates on 2.x; a 3.0 bump changes per_listener_settings and must be a deliberate migration.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["eclipse-mosquitto"],
+      "allowedVersions": "<3.0.0"
     }
   ]
 }

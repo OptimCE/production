@@ -1,5 +1,5 @@
 -- ===========================================================================
--- Six logical databases in one instance — NOT one database with six schemas.
+-- Seven logical databases in one instance — NOT one database with seven schemas.
 --
 -- Every annexe service documents "cross-DB references are plain columns, never
 -- foreign keys". Separate databases are what currently enforce that by physics.
@@ -33,7 +33,8 @@ SELECT format('CREATE DATABASE %I OWNER %I', d.name, d.owner)
     ('simulation_key_local',          'simulation_key_svc'),
     ('news_board_local',              'news_board_svc'),
     ('billing_local',                 'billing_svc'),
-    ('administrative_document_local', 'administrative_document_svc')
+    ('administrative_document_local', 'administrative_document_svc'),
+    ('live_data_local',               'live_data_svc')
   ) AS d(name, owner)
  WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = d.name)
 \gexec
@@ -47,7 +48,8 @@ REVOKE CONNECT ON DATABASE
     simulation_key_local,
     news_board_local,
     billing_local,
-    administrative_document_local
+    administrative_document_local,
+    live_data_local
   FROM PUBLIC;
 
 -- template1 too, so a seventh database created here later inherits "PUBLIC
@@ -64,6 +66,7 @@ GRANT CONNECT ON DATABASE simulation_key_local          TO simulation_key_svc;
 GRANT CONNECT ON DATABASE news_board_local              TO news_board_svc;
 GRANT CONNECT ON DATABASE billing_local                 TO billing_svc;
 GRANT CONNECT ON DATABASE administrative_document_local TO administrative_document_svc;
+GRANT CONNECT ON DATABASE live_data_local                TO live_data_svc;
 
 -- crm_db: its owner, plus every consumer of the read-only CRM port — including
 -- notification_dispatch_svc, whose ONLY database this is. What each of them may
@@ -75,4 +78,5 @@ GRANT CONNECT ON DATABASE crm_db TO
     news_board_svc,
     billing_svc,
     administrative_document_svc,
-    notification_dispatch_svc;
+    notification_dispatch_svc,
+    live_data_svc;

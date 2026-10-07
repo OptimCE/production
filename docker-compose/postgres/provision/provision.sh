@@ -54,7 +54,8 @@ allocation_key_local|allocation_key_svc|allocation_key_local.sql
 simulation_key_local|simulation_key_svc|simulation_key_local.sql
 news_board_local|news_board_svc|news_board_local.sql
 billing_local|billing_svc|billing_local.sql
-administrative_document_local|administrative_document_svc|administrative_document_local.sql'
+administrative_document_local|administrative_document_svc|administrative_document_local.sql
+live_data_local|live_data_svc|live_data_local.sql'
 
 # --- 0. Wait ---------------------------------------------------------------
 # `depends_on: service_healthy` already covers the compose path. This makes
@@ -83,6 +84,7 @@ $PSQL -d postgres \
     -v billing_password="$BILLING_DB_PASSWORD" \
     -v administrative_document_password="$ADMINISTRATIVE_DOCUMENT_DB_PASSWORD" \
     -v notification_dispatch_password="$NOTIFICATION_DISPATCH_DB_PASSWORD" \
+    -v live_data_password="${LIVE_DATA_DB_PASSWORD:-}" \
     -f "$SQL_DIR/00-roles.sql"
 
 # --- 2. Databases + CONNECT ACLs -------------------------------------------
@@ -113,11 +115,11 @@ while IFS='|' read -r db owner schema; do
     # current schema — optimce-migrator has carried crm_db well past it — so
     # re-applying it would be wrong even if it were harmless.
     #
-    # The five annexe schema.sql files are, by contrast, idempotent (CREATE
+    # The six annexe schema.sql files are, by contrast, idempotent (CREATE
     # TABLE / CREATE INDEX IF NOT EXISTS throughout, DROP TRIGGER IF EXISTS
     # before every CREATE TRIGGER). They are guarded anyway: replay buys nothing
     # (`CREATE TABLE IF NOT EXISTS` never adds a COLUMN, so it is not a migration
-    # mechanism), and one rule for all six databases is one rule to reason about
+    # mechanism), and one rule for all seven databases is one rule to reason about
     # instead of two.
     #
     # A HALF-applied schema reads as non-empty and is therefore skipped. That is

@@ -7,6 +7,8 @@ docker-compose/krakend_config/simulation.json
 docker-compose/krakend_config/news-board.json
 docker-compose/krakend_config/billing.json
 docker-compose/krakend_config/administrative-document.json
+docker-compose/krakend_config/live.json
+docker-compose/krakend_config/live-public.json
 
 # Generated, never a source file. The `init` profile writes the gateway's root
 # spec as `root.yaml` above; `swagger.yaml` is the older name for the same output

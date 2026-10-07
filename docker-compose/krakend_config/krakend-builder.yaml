@@ -33,3 +33,32 @@ services:
   administrative-document:
     swagger: /config/administrative-document.json
     host: administrative-document:8000
+
+  # ---- live-data: ONE service, TWO entries ----------------------------------
+  #
+  # The JWT validator is gated PER SERVICE ENTRY, never per endpoint, so a
+  # service with one public route among authenticated ones cannot be one entry.
+  # Hence two keys on the same host, backed by the two DISJOINT swagger files
+  # that live-data-doc-gen downloads (docker-compose.yml).
+  #
+  # THE KEYS ARE THE NAMESPACE: the generator mounts every service but `root` at
+  # `/<key>`, so these must stay literally `live` and `live-public`. The frozen
+  # device protocol says `/live-public/enroll`, and `live-data` as a key would
+  # move it. No `prefix:` on either (decision D-2): the subtrees are disjoint by
+  # construction, so a (path, method) collision — which panics the gateway and
+  # takes every other endpoint down with it — cannot happen between them.
+  #
+  # The host need not resolve when the live-data profile is not running: KrakenD
+  # resolves it per request, so only these routes fail until it does.
+  live:
+    swagger: /config/live.json
+    host: live-data:8000
+
+  live-public:
+    swagger: /config/live-public.json
+    host: live-data:8000
+    # THE PLATFORM'S ONLY UNAUTHENTICATED SERVICE ENTRY. It does NOT strip the
+    # x-user-* headers (`input_headers` is global in the generator): nginx's
+    # `location = /api/live-public/enroll` blanks them, and live-data's own
+    # tests/test_public_surface.py is the second lock.
+    auth: false

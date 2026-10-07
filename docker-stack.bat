@@ -60,6 +60,14 @@ if /i "%COMMAND%"=="survey-ean" (
     call :survey_ean
     exit /b !errorlevel!
 )
+if /i "%COMMAND%"=="mqtt-cert" (
+    call :mqtt_cert
+    exit /b !errorlevel!
+)
+if /i "%COMMAND%"=="renew-certs" (
+    call :renew_certs
+    exit /b !errorlevel!
+)
 if /i "%COMMAND%"=="help" goto :usage
 if /i "%COMMAND%"=="-h" goto :usage
 if /i "%COMMAND%"=="--help" goto :usage
@@ -71,13 +79,15 @@ goto :usage
 echo Usage: docker-stack.bat ^<command^> [options]
 echo.
 echo Commands:
-echo   start      Pull images (optional) and start init, backend, then frontend
-echo   stop       Stop init, backend, and frontend profiles
-echo   restart    Stop then start
-echo   migrate    Apply pending database migrations, then re-converge the grants
-echo   verify     Prove the database isolation and the CRM grant matrix
-echo   survey-ean Report every stored EAN that is not 18 digits (read-only)
-echo   help       Show this help message
+echo   start       Pull images (optional) and start init, backend, frontend, then live-data
+echo   stop        Stop every profile (backups first)
+echo   restart     Stop then start
+echo   migrate     Apply pending database migrations, then re-converge the grants
+echo   verify      Prove the database isolation and the CRM grant matrix
+echo   survey-ean  Report every stored EAN that is not 18 digits (read-only)
+echo   mqtt-cert   Issue the MQTT broker's certificate (once; needs the DNS record)
+echo   renew-certs Renew every certificate due, reload nginx and the broker
+echo   help        Show this help message
 echo.
 echo Options (for start/restart):
 echo   --no-pull                  Skip image pull before starting
@@ -124,6 +134,12 @@ if errorlevel 1 exit /b 1
 if "%PULL_IMAGES%"=="true" (
     %DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --profile init --profile backend --profile frontend pull
     if errorlevel 1 exit /b 1
+    rem Separately and non-fatally - see start_stack in docker-stack.sh.
+    findstr /r /c:"^LIVE_DATA_ENABLED=false" "%ENV_FILE%" >nul 2>&1
+    if errorlevel 1 (
+        %DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" --profile backend --profile live-data pull mosquitto live-data live-data-worker
+        if errorlevel 1 echo WARNING: could not pull the live-data images ^(see docs\runbooks\live-data.md^). Continuing.
+    )
 )
 
 %DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --profile init --env-file "%ENV_FILE%" up -d
@@ -142,7 +158,27 @@ call :check_frontend_config
 if errorlevel 1 exit /b 1
 
 %DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --profile frontend --env-file "%ENV_FILE%" up -d
-exit /b %errorlevel%
+if errorlevel 1 exit /b 1
+
+call :start_live_data
+exit /b 0
+
+:start_live_data
+rem LAST and NON-FATAL, deliberately - see start_live_data in docker-stack.sh.
+rem A half-configured live-data must never keep the reverse proxy down.
+findstr /r /c:"^LIVE_DATA_ENABLED=false" "%ENV_FILE%" >nul 2>&1
+if not errorlevel 1 (
+    echo live-data: off ^(LIVE_DATA_ENABLED=false in %ENV_FILE%^) - not started.
+    exit /b 0
+)
+echo Starting live-data (a failure here leaves the rest of the platform running)...
+%DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" --profile backend --profile live-data up -d
+if errorlevel 1 (
+    echo.
+    echo WARNING: the live-data profile did not start cleanly. Everything else is up.
+    echo   Usual causes and fixes: docs\runbooks\live-data.md
+)
+exit /b 0
 
 :check_frontend_config
 rem crm-frontend bind-mounts a SINGLE FILE, config.json, over the one inside the
@@ -178,14 +214,17 @@ exit /b 0
 :stop_stack
 echo Running backups before stopping...
 call :do_backup
-%DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --profile init --profile backend --profile frontend down
+rem live-data included: left out, its containers keep running and `down` fails to
+rem remove the networks they are attached to.
+%DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --profile init --profile backend --profile frontend --profile live-data down
 exit /b %errorlevel%
 
 :do_backup
-rem Two jobs, because there are two instances. db-backup loops the five application
-rem databases plus the cluster globals; keycloak-db-backup covers the separate
-rem Keycloak instance. A failure is reported but does not abort the other job.
-for %%J in (db-backup keycloak-db-backup) do (
+rem Three jobs. db-backup loops the application databases plus the cluster
+rem globals; keycloak-db-backup covers the separate Keycloak instance;
+rem mosquitto-backup copies the broker's dynamic-security.json, every enrolled
+rem device's credential. A failure is reported but does not abort the others.
+for %%J in (db-backup keycloak-db-backup mosquitto-backup) do (
     echo Running %%J...
     %DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" --profile backup run --rm %%J
     if errorlevel 1 echo %%J failed
@@ -227,6 +266,54 @@ rem not run. Deliberately not part of verify, which one legacy row must not
 rem turn red.
 %DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --profile backend --env-file "%ENV_FILE%" run --rm --no-deps --entrypoint sh postgres-init /postgres/verify/ean-survey.sh
 exit /b %errorlevel%
+
+:mqtt_cert
+rem FIRST issuance of the MQTT broker's certificate - see mqtt_cert in
+rem docker-stack.sh. Needs the DNS record pointing at this host and the reverse
+rem proxy answering on port 80.
+call :check_docker_service
+if errorlevel 1 exit /b 1
+findstr /r /c:"^LIVE_DATA_BROKER_PUBLIC_HOST=." "%ENV_FILE%" >nul 2>&1
+if errorlevel 1 (
+    echo LIVE_DATA_BROKER_PUBLIC_HOST is not set in %ENV_FILE%.
+    exit /b 1
+)
+%DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" --profile certs run --rm certbot-mqtt
+if errorlevel 1 exit /b 1
+call :refresh_broker_certificate
+exit /b 0
+
+:refresh_broker_certificate
+rem Copies the certificate into the broker's volume; restarts the broker only when
+rem it changed, so a no-op renewal never drops the devices' connections.
+set "CERT_LOG=%TEMP%\optimce-mosquitto-certs.log"
+%DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" --profile backend --profile live-data run --rm mosquitto-certs > "%CERT_LOG%" 2>&1
+type "%CERT_LOG%"
+findstr /c:"certificate changed: yes" "%CERT_LOG%" >nul 2>&1
+if not errorlevel 1 (
+    echo Restarting the broker to load the new certificate...
+    %DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" --profile backend --profile live-data restart mosquitto
+)
+del "%CERT_LOG%" >nul 2>&1
+exit /b 0
+
+:renew_certs
+rem Every lineage - web and broker - then each consumer reloads. See renew_certs
+rem in docker-stack.sh for the schedule and why the broker half matters.
+call :check_docker_service
+if errorlevel 1 exit /b 1
+set "RENEW_STATUS=0"
+%DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" --profile frontend run --rm certbot renew --webroot -w /webroot --non-interactive
+if errorlevel 1 set "RENEW_STATUS=1"
+%DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" --profile frontend exec -T reverse-proxy nginx -s reload
+findstr /r /c:"^LIVE_DATA_BROKER_PUBLIC_HOST=." "%ENV_FILE%" >nul 2>&1
+if not errorlevel 1 call :refresh_broker_certificate
+%DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" --profile frontend run --rm certbot certificates
+if "%RENEW_STATUS%"=="1" (
+    echo Renewal reported a FAILURE - read the certbot output above.
+    exit /b 1
+)
+exit /b 0
 
 :migrate_stack
 rem The migrator is in the `migration` profile but depends_on postgres and

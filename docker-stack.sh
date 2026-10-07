@@ -7,19 +7,25 @@ WAIT_INIT_SECONDS=10
 WAIT_BACKEND_SECONDS=10
 PULL_IMAGES=true
 MIGRATE_DRY_RUN=false
+# The live-data services gate on postgres/postgres-init, which live in `backend`;
+# compose rejects a depends_on target outside the enabled profiles, so every
+# command that names the live-data profile enables both.
+LIVE_DATA_PROFILES=(--profile backend --profile live-data)
 
 usage() {
     cat <<'EOF'
 Usage: ./docker-stack.sh <command> [options]
 
 Commands:
-    start      Pull images (optional) and start init, backend, then frontend
-    stop       Stop init, backend, and frontend profiles
-    restart    Stop then start
-    migrate    Apply pending database migrations, then re-converge the grants
-    verify     Prove the database isolation and the CRM grant matrix
-    survey-ean Report every stored EAN that is not 18 digits (read-only)
-    help       Show this help message
+    start       Pull images (optional) and start init, backend, frontend, then live-data
+    stop        Stop every profile (backups first)
+    restart     Stop then start
+    migrate     Apply pending database migrations, then re-converge the grants
+    verify      Prove the database isolation and the CRM grant matrix
+    survey-ean  Report every stored EAN that is not 18 digits (read-only)
+    mqtt-cert   Issue the MQTT broker's certificate (once; needs the DNS record)
+    renew-certs Renew every certificate due, reload nginx and the broker (cron)
+    help        Show this help message
 
 Options (for start/restart):
     --no-pull                  Skip image pull before starting
@@ -66,6 +72,14 @@ start_stack() {
 
     if [ "$PULL_IMAGES" = true ]; then
         compose -f "$COMPOSE_FILE" --profile init --profile backend --profile frontend pull
+        # Separately and non-fatally: a live-data image that cannot be pulled
+        # (e.g. its GHCR package still private) must not abort the deploy of
+        # everything else. start_live_data reports what that means.
+        if live_data_enabled; then
+            compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "${LIVE_DATA_PROFILES[@]}" \
+                pull mosquitto live-data live-data-worker \
+                || echo "WARNING: could not pull the live-data images (see docs/runbooks/live-data.md). Continuing."
+        fi
     fi
 
     compose -f "$COMPOSE_FILE" --profile init --env-file "$ENV_FILE" up -d
@@ -80,6 +94,32 @@ start_stack() {
 
     check_frontend_config
     compose -f "$COMPOSE_FILE" --profile frontend --env-file "$ENV_FILE" up -d
+
+    start_live_data
+}
+
+start_live_data() {
+    # LAST and NON-FATAL, deliberately. live-data is the only part of the
+    # platform with public infrastructure of its own (the MQTT broker on 8883, its
+    # DNS name and certificate), so it is also the part most likely to be
+    # half-configured - and nothing else depends on it. Started inside the
+    # backend step, one failing one-shot here would abort this script before the
+    # reverse proxy came up. Here, a failure is reported and the site stays up.
+    #
+    # `up -d` over backend + live-data is a no-op for the backend services that
+    # are already running; the idempotent backend one-shots (postgres-init,
+    # minio-init) run once more, which is what the live-data services gate on.
+    if ! live_data_enabled; then
+        echo "live-data: off (LIVE_DATA_ENABLED=false in ${ENV_FILE}) - not started."
+        return 0
+    fi
+    echo "Starting live-data (a failure here leaves the rest of the platform running)..."
+    if ! compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "${LIVE_DATA_PROFILES[@]}" up -d; then
+        echo
+        echo "WARNING: the live-data profile did not start cleanly. Everything else is up."
+        echo "  Inspect: ${DOCKER_COMPOSE_CMD[*]} -f ${COMPOSE_FILE} --env-file ${ENV_FILE} --profile backend --profile live-data ps -a"
+        echo "  Usual causes and fixes: docs/runbooks/live-data.md"
+    fi
 }
 
 check_frontend_config() {
@@ -116,15 +156,18 @@ check_frontend_config() {
 stop_stack() {
     echo "Running backups before stopping..."
     do_backup
-    compose -f "$COMPOSE_FILE" --profile init --profile backend --profile frontend down
+    # live-data included: left out, its containers keep running and `down` then
+    # fails to remove the networks they are still attached to.
+    compose -f "$COMPOSE_FILE" --profile init --profile backend --profile frontend --profile live-data down
 }
 
 do_backup() {
-    # Two jobs, because there are two instances. `db-backup` loops the five
-    # application databases plus the cluster globals; `keycloak-db-backup` covers
-    # the separate Keycloak instance. A failure is reported but does not abort the
-    # other job, so one broken dump cannot block the shutdown.
-    local jobs="db-backup keycloak-db-backup"
+    # Three jobs. `db-backup` loops the application databases plus the cluster
+    # globals; `keycloak-db-backup` covers the separate Keycloak instance;
+    # `mosquitto-backup` copies the broker's dynamic-security.json (every enrolled
+    # device's credential - it is in no database). A failure is reported but does
+    # not abort the others, so one broken job cannot block the shutdown.
+    local jobs="db-backup keycloak-db-backup mosquitto-backup"
 
     for job in $jobs; do
         echo "Running ${job}..."
@@ -186,6 +229,102 @@ survey_ean() {
     # and grants, and one legacy row must not turn it red.
     MSYS_NO_PATHCONV=1 compose -f "$COMPOSE_FILE" --profile backend --env-file "$ENV_FILE" \
         run --rm --no-deps --entrypoint sh postgres-init /postgres/verify/ean-survey.sh
+}
+
+live_data_enabled() {
+    # LIVE_DATA_ENABLED=false in .env keeps the live-data profile off (a staging
+    # stack, or the annexe parked). Absent or anything else = on. `stop` brings
+    # the profile down either way.
+    local v
+    v=$({ grep -E '^LIVE_DATA_ENABLED=' "$ENV_FILE" || true; } | tail -n 1 | cut -d= -f2- | tr -d "\"' \r")
+    [ "$v" != "false" ]
+}
+
+broker_host() {
+    # The value as written in .env, quotes and CR stripped. Read here rather than
+    # through compose so the error can name the file to fix.
+    #
+    # `|| true` is load-bearing: with no such line grep exits 1, pipefail fails
+    # the pipeline, and under `set -e` the caller's `host=$(broker_host)` would
+    # end the script silently instead of printing which variable is missing.
+    { grep -E '^LIVE_DATA_BROKER_PUBLIC_HOST=' "$ENV_FILE" || true; } | tail -n 1 | cut -d= -f2- | tr -d "\"' \r"
+}
+
+mqtt_cert() {
+    # FIRST issuance of the MQTT broker's certificate: a separate Let's Encrypt
+    # lineage for LIVE_DATA_BROKER_PUBLIC_HOST, RSA, chain pinned to ISRG Root X1
+    # (see certbot-mqtt in docker-compose.yml). Renewals go through renew-certs.
+    #
+    # Needs the DNS record pointing at this host, and the reverse proxy answering
+    # on port 80 - any running stack does, before or after this release.
+    check_docker_service
+    local host
+    host=$(broker_host)
+    if [ -z "$host" ]; then
+        echo "LIVE_DATA_BROKER_PUBLIC_HOST is not set in ${ENV_FILE}."
+        exit 1
+    fi
+    echo "Requesting the broker certificate for ${host} (HTTP-01 over port 80)..."
+    compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" --profile certs run --rm certbot-mqtt
+    refresh_broker_certificate
+}
+
+refresh_broker_certificate() {
+    # Copies the current certificate into the broker's own volume, and restarts
+    # the broker ONLY if the certificate changed: a no-op renewal must not drop
+    # every device connection. Never fatal - the broker keeps its old copy.
+    local out
+    if ! out=$(compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "${LIVE_DATA_PROFILES[@]}" \
+            run --rm mosquitto-certs 2>&1); then
+        printf '%s\n' "$out"
+        echo "WARNING: mosquitto-certs failed; the broker keeps the certificate it has."
+        return 0
+    fi
+    printf '%s\n' "$out"
+    if printf '%s\n' "$out" | grep -q 'certificate changed: yes'; then
+        if [ -n "$(compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "${LIVE_DATA_PROFILES[@]}" ps -q mosquitto)" ]; then
+            echo "Restarting the broker to load the new certificate (devices reconnect on their own)..."
+            compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "${LIVE_DATA_PROFILES[@]}" restart mosquitto
+        else
+            echo "The broker is not running; it loads the certificate when the live-data profile starts."
+        fi
+    fi
+}
+
+renew_certs() {
+    # Every lineage certbot holds - the web certificate and the broker's - in one
+    # pass, then each consumer reloads. Meant for cron; weekly is plenty, since
+    # certbot only renews within 30 days of expiry:
+    #
+    #   17 4 * * 1  cd /home/production && ./docker-stack.sh renew-certs >> /var/log/optimce-renew-certs.log 2>&1
+    #
+    # The broker half is the one that cannot be skipped: without it, every device
+    # fails its TLS handshake within the same hour about 90 days in, while the
+    # web application looks perfectly fine (plan §15.1).
+    check_docker_service
+    echo "== $(date -u '+%Y-%m-%dT%H:%M:%SZ') renewing every certificate that is due..."
+    local status=0
+    compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" --profile frontend \
+        run --rm certbot renew --webroot -w /webroot --non-interactive || status=$?
+
+    if [ -n "$(compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" --profile frontend ps -q reverse-proxy)" ]; then
+        compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" --profile frontend \
+            exec -T reverse-proxy nginx -s reload || status=1
+    fi
+
+    if [ -n "$(broker_host)" ]; then
+        refresh_broker_certificate
+    fi
+
+    # The expiry monitor: one line per lineage with its remaining validity. An
+    # expiry nobody watches is invisible until devices go silent.
+    compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" --profile frontend \
+        run --rm certbot certificates 2>/dev/null | grep -E 'Certificate Name|Expiry Date' || true
+
+    if [ "$status" -ne 0 ]; then
+        echo "Renewal reported a FAILURE (exit ${status}) - read the certbot output above."
+        exit "$status"
+    fi
 }
 
 migrate_stack() {
@@ -317,6 +456,12 @@ main() {
             ;;
         survey-ean)
             survey_ean
+            ;;
+        mqtt-cert)
+            mqtt_cert
+            ;;
+        renew-certs)
+            renew_certs
             ;;
         help|-h|--help)
             usage

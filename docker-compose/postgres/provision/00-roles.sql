@@ -18,7 +18,7 @@
 
 -- ALTER ROLE ... PASSWORD is echoed verbatim into the server log when
 -- log_statement is 'ddl' or 'all'. The default is 'none', but pin it for this
--- session so a server configured to log DDL does not persist five cleartext
+-- session so a server configured to log DDL does not persist eight cleartext
 -- passwords. (password_encryption defaults to scram-sha-256, so nothing is
 -- cleartext at rest.)
 SET log_statement = 'none';
@@ -42,7 +42,11 @@ BEGIN
     -- Owns no database. It exists only to hold a narrow write grant on crm_db:
     -- the outbound_message queue lives in the CRM schema so that a producer's
     -- enqueue rides on its own transaction. See 30-crm-grants.sql.
-    'notification_dispatch_svc'
+    'notification_dispatch_svc',
+    -- live-data (API, ingest worker and scheduler share it). Created whether or
+    -- not the live-data profile runs, so the isolation matrix is the same
+    -- everywhere.
+    'live_data_svc'
   ] LOOP
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = r) THEN
       EXECUTE format(
@@ -64,3 +68,9 @@ ALTER ROLE news_board_svc              WITH LOGIN PASSWORD :'news_board_password
 ALTER ROLE billing_svc                 WITH LOGIN PASSWORD :'billing_password';
 ALTER ROLE administrative_document_svc WITH LOGIN PASSWORD :'administrative_document_password';
 ALTER ROLE notification_dispatch_svc   WITH LOGIN PASSWORD :'notification_dispatch_password';
+-- An EMPTY live_data_password (LIVE_DATA_DB_PASSWORD missing from .env) is not an
+-- error: Postgres answers "empty string is not a valid password, clearing
+-- password", so the role exists and simply cannot log in. That keeps a
+-- half-configured live-data from failing postgres-init — and with it every
+-- service in the stack.
+ALTER ROLE live_data_svc               WITH LOGIN PASSWORD :'live_data_password';

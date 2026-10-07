@@ -41,6 +41,7 @@ pw_for() {
         billing_svc)                 printf '%s' "$BILLING_DB_PASSWORD" ;;
         administrative_document_svc) printf '%s' "$ADMINISTRATIVE_DOCUMENT_DB_PASSWORD" ;;
         notification_dispatch_svc)   printf '%s' "$NOTIFICATION_DISPATCH_DB_PASSWORD" ;;
+        live_data_svc)               printf '%s' "${LIVE_DATA_DB_PASSWORD:-}" ;;
         *) printf '' ;;
     esac
 }
@@ -81,12 +82,12 @@ absent() {
     printf '          or a restore is incomplete. It is NOT a grant problem.\n'
 }
 
-AUDIT_WRITERS='allocation_key_svc simulation_key_svc news_board_svc billing_svc administrative_document_svc'
+AUDIT_WRITERS='allocation_key_svc simulation_key_svc news_board_svc billing_svc administrative_document_svc live_data_svc'
 NOTIFIERS='news_board_svc billing_svc administrative_document_svc'
 
 # ---------------------------------------------------------------------------
 echo
-echo 'audit_log INSERT + audit_log_id_seq USAGE — all five annexe roles'
+echo 'audit_log INSERT + audit_log_id_seq USAGE — all six annexe roles'
 echo '  (id_community is nullable, so this ALWAYS inserts exactly one row and'
 echo '   therefore ALWAYS calls nextval — the sequence grant is really exercised,'
 echo '   not skipped because a lookup happened to return nothing.)'

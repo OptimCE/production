@@ -9,3 +9,9 @@ docker-compose/schemas/*.sql      text eol=lf
 
 # Same reasoning for the entrypoint scripts the stack shells out to.
 docker-stack.sh                   text eol=lf
+
+# The Mosquitto broker's config and its one-shot scripts, run by busybox `sh`
+# inside the broker image. A CRLF mosquitto.conf is worse than a CRLF script: the
+# stray \r ends up INSIDE values (a listener address, a file path) and the broker
+# fails on a name that looks correct in every editor.
+docker-compose/mosquitto/*        text eol=lf

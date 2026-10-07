@@ -197,8 +197,60 @@ and this project adheres to
   instead of grepping `config/annexes-services.json`, which now also lists entries
   that are switched off.
 
+### Added (Live Data - MQTT telemetry)
+
+- **The `live-data` profile**: `live-data` (API, `ghcr.io/optimce/live-data:main-prod`),
+  `live-data-worker` (MQTT ingest) and `live-data-scheduler` (rollups, ownership,
+  partitions, retention; same `:main-worker` image), plus the Mosquitto 2.1.2 broker and
+  three one-shots (`mosquitto-certs`, `mosquitto-init`, `mosquitto-roles`).
+  - **Its own profile, started last and non-fatally** by `docker-stack.sh`: a missing
+    certificate, an unset variable or an unpullable image is reported and leaves the
+    rest of the platform running. Every command that names it also enables `backend`;
+    nothing outside it depends on it, so krakend does not wait for live-data.
+  - **The broker publishes 8883 (TLS) only.** TLS terminates in Mosquitto; plaintext
+    1883 stays on the new `mqtt` network (broker, roles job, API, ingest worker). The
+    TLS listener is an `include_dir` file written by `mosquitto-certs` only when the
+    certificate exists, so a missing certificate never stops the broker.
+  - **A separate certificate lineage** for `LIVE_DATA_BROKER_PUBLIC_HOST`
+    (`mqtt.optimce.be`, decision D-3): `certbot-mqtt` (profile `certs`), RSA,
+    `--preferred-chain "ISRG Root X1"` (D-4a) — X1 is trusted until **2030-06-04**, the
+    fleet's end-of-life date. The hostname is written into every device and is
+    permanent.
+  - Only the API holds the broker admin's credentials. The worker and scheduler pass
+    the shared production boot check with explicit placeholders: the worker parses
+    untrusted device payloads and must not hold the credential that mints and revokes
+    devices.
+- **`live_data_local` + `live_data_svc`**: provisioned by `postgres-init` (roles,
+  database, CONNECT, the CRM grant matrix — SELECT plus `audit_log` INSERT, like
+  simulation-key) whether or not the profile runs; `isolation.sh` and
+  `positive-writes.sh` prove it (108 and 15 checks on a fresh instance). An empty
+  `LIVE_DATA_DB_PASSWORD` does not fail provisioning: Postgres clears the password and
+  the role cannot log in. Baseline `schemas/live_data_local.sql` embodies
+  `schema_version` 4; the migrator does not manage this database yet.
+- **The public enrolment leg**: `location = /api/live-public/enroll` in both nginx
+  templates — exact match, the five gateway-trust headers blanked, `limit_req` per IP
+  (6r/m, burst 5; a literal, so no variable can render `rate=;`), body capped at 4 KB —
+  and a port-80 `server_name mqtt.*` block that serves only the ACME challenge.
+- **KrakenD**: `live` and `live-public` (`auth: false`) builder entries over the two
+  specs `live-data-doc-gen` downloads. The gateway grows from 191 to 210 endpoints; no
+  existing endpoint changes.
+- **`docker-stack.sh mqtt-cert`** (first issuance) and **`renew-certs`** (every lineage,
+  nginx reload, broker refresh with a restart only if the certificate changed, expiry
+  dates printed — run it from cron). Mirrored in `docker-stack.bat`.
+- **Backups**: `live_data_local` in `db-backup`, and `mosquitto-backup` copies the
+  broker's `dynamic-security.json` — every device's credential, in no database.
+- `max_connections` arithmetic on `postgres` updated: 270 of 300.
+- `docs/runbooks/live-data.md`.
+
 ### Fixed
 
+- **KrakenD pinned to 2.13.11, by digest.** `krakend:latest` became 3.0.0 on
+  2026-09-30, and 3.x refuses the configuration swagger2krakend generates
+  (`unsupported version: 3 (want: 4)`): the next `docker compose pull` would have left
+  the gateway unable to start and every `/api` route down. 2.13.11 accepts and serves
+  this repo's generated config (checked 2026-10-07). `.github/renovate.json` holds
+  KrakenD below 3.0 until a swagger2krakend release emits version 4, and Mosquitto
+  below 3.0.
 - **A consumption import answered 500 although it had succeeded.** KrakenD gave
   every endpoint 3000 ms, and `POST /sharing_operations/consumptions` routinely
   needs more: a one-month, five-meter RESA file took ~3 s, a corrected one ~10 s.

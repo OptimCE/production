@@ -74,6 +74,28 @@ services:
       - ./krakend_config:/data:z
     restart: on-failure
 
+  # TWO OpenAPI files for ONE service, unlike every other annexe: KrakenD gates
+  # its JWT validator per SERVICE ENTRY, never per endpoint, so live-data's one
+  # public route (the device enrolment, `auth: false`) needs its own `services:`
+  # key in krakend-builder.yaml, and therefore its own swagger. live-data's docs
+  # workflow publishes the pair already split; there is no swagger.yml there.
+  # Downloaded even when the live-data profile is not started: the routes then
+  # exist in the gateway and answer an upstream error, nothing else changes.
+  live-data-doc-gen:
+    profiles: ["init"]
+    image: alpine/curl:latest
+    command:
+      - "-fL"
+      - "https://optimce.github.io/live-data/live.json"
+      - "-o"
+      - "/data/live.json"
+      - "https://optimce.github.io/live-data/live-public.json"
+      - "-o"
+      - "/data/live-public.json"
+    volumes:
+      - ./krakend_config:/data:z
+    restart: on-failure
+
   krakend-config:
     profiles: ["init"]
     image: ghcr.io/optimce/swagger2krakend:main
@@ -98,6 +120,8 @@ services:
       billing-doc-gen:
         condition: service_completed_successfully
       administrative-document-doc-gen:
+        condition: service_completed_successfully
+      live-data-doc-gen:
         condition: service_completed_successfully
 
   keycloak-config:
@@ -202,14 +226,18 @@ services:
     # consumer below, not guessed:
     #
     #   9 two-pool Python processes x (CRM 5+5 + LOCAL 5+5) = 180
+    #   3 live-data processes (API, worker, scheduler) x 20 =  60
     #   notification-dispatch (CRM pool only, 5+5)          =  10
     #   crm-backend (node-postgres pool)                    =  10
     #   migrator + postgres-init + backup + admin           = ~10
     #                                                         ---
-    #                                                         210
+    #                                                         270
+    #
+    # 270 of 300. The next annexe that brings its own two-pool processes must
+    # raise max_connections in the same change.
     #
     # The coded default in each Python service is POOL_SIZE=20 + MAX_OVERFLOW=10
-    # — 60 per two-pool process, 540 for the nine. Spread over six instances that
+    # — 60 per two-pool process, 720 for the twelve. Spread over six instances that
     # ceiling was never met; one instance meets all of it at once. The
     # CRM_DB_POOL_SIZE / LOCAL_DB_POOL_SIZE lines below are therefore load
     # bearing, not tuning.
@@ -277,6 +305,12 @@ services:
       # notification-dispatch owns no database; this password is for a role that
       # exists solely to hold narrow write grants on crm_db.
       - NOTIFICATION_DISPATCH_DB_PASSWORD=${NOTIFICATION_DISPATCH_DB_PASSWORD}
+      # Provisioned whether or not the live-data profile is started, so that
+      # `./docker-stack.sh verify` proves the same matrix everywhere. An empty
+      # value is not fatal here — Postgres answers "empty string is not a valid
+      # password, clearing password" and the role simply cannot log in — so a
+      # missing line costs live-data, never the platform.
+      - LIVE_DATA_DB_PASSWORD=${LIVE_DATA_DB_PASSWORD:-}
     entrypoint: ["/bin/sh", "/postgres/provision/provision.sh"]
     volumes:
       - ./postgres:/postgres:ro
@@ -289,6 +323,11 @@ services:
       - ./schemas/news_board_local.sql:/schemas/news_board_local.sql:ro
       - ./schemas/billing_local.sql:/schemas/billing_local.sql:ro
       - ./schemas/administrative_document_local.sql:/schemas/administrative_document_local.sql:ro
+      # live-data's baseline embodies schema_version 4, which is what the image's
+      # /health/readiness compares against, so a fresh live_data_local needs no
+      # migration. live_data_local is NEW here: this file is applied on the first
+      # start that sees the empty database, and never again.
+      - ./schemas/live_data_local.sql:/schemas/live_data_local.sql:ro
     networks:
       - database
 
@@ -564,7 +603,15 @@ services:
 
   krakend:
     profiles: ["backend"]
-    image: krakend:latest
+    # PINNED to the 2.13 line, by digest. `krakend:latest` became KrakenD 3.0.0
+    # on 2026-09-30, and 3.x REFUSES the configuration swagger2krakend generates:
+    # "unsupported version: 3 (want: 4)" — the gateway would not start and every
+    # /api route would be down after the next `docker compose pull`. Checked on
+    # 2026-10-07: 2.13.11 accepts this repo's generated krakend.json (`krakend
+    # check -t`) and serves it; 3.0.0 rejects it. Move to 3.x only together with
+    # a swagger2krakend release that emits version 4; .github/renovate.json holds
+    # the major bump back until then.
+    image: krakend:2.13.11@sha256:26eb32dbb0e679c62170b21b4efb0729dc00262afd98fe6210110dbbbdd6425f
     volumes:
       - ./krakend_config:/etc/krakend
     networks:
@@ -673,8 +720,9 @@ services:
       # ---- Annex catalogue switches --------------------------------------
       # config/annexes-services.json is baked into the image and shared by every
       # deployment. An entry that ships "defaultEnabled": false stays hidden until
-      # named in ENABLE (live-data ships that way, and its service does not run
-      # here); DISABLE hides an entry and wins over ENABLE. Comma-separated feature
+      # named in ENABLE (live-data ships that way: name it once the live-data
+      # profile below runs here, never before); DISABLE hides an entry and wins
+      # over ENABLE. Comma-separated feature
       # names, empty = none. A name the image's catalogue does not contain REFUSES
       # THE BOOT - a restart loop logging annexes_services:catalog_overrides. The
       # set actually served is logged once at boot as annexes_services:catalog_loaded.
@@ -1331,6 +1379,300 @@ services:
         condition: service_completed_successfully
 
   # ============================================
+  # LIVE DATA PROFILE - MQTT telemetry ingestion (the Live Data annexe)
+  # ============================================
+  # Its OWN profile, deliberately, unlike every other annexe. It is the only part
+  # of the platform with public infrastructure of its own — a broker on 8883, a
+  # DNS name and a certificate lineage (mqtt.<domain>, decisions D-3 and D-4), a
+  # firewall opening — and therefore failure modes the platform must not
+  # inherit. docker-stack.sh starts it LAST, after the frontend, and a failure
+  # there is reported without stopping anything else. Inside the backend
+  # profile, one failing one-shot below (no certificate yet, a variable not yet
+  # in .env, an image not yet public) would abort `--profile backend up`, and the
+  # script with it, before the reverse proxy ever started.
+  #
+  # Two consequences of the separate profile:
+  #   * Every compose command that names these services must ALSO enable
+  #     `--profile backend`: they gate on postgres / postgres-init, and compose
+  #     rejects a depends_on target outside the enabled profiles.
+  #   * Nothing outside this section may depend on a service inside it, for the
+  #     same reason the other way round. krakend therefore does NOT wait for
+  #     live-data: until it is up, /api/live/* answers an upstream error and
+  #     every other route is unaffected.
+  #
+  # Offer it to managers with ANNEX_CATALOG_ENABLE=live-data (crm-backend, above)
+  # only once this profile runs. Procedure, certificate renewal and the dynsec
+  # backup: docs/runbooks/live-data.md.
+  #
+  # Images: ghcr.io/optimce/live-data:main-prod (API) and :main-worker (ingest
+  # worker AND scheduler — one image, two entrypoints).
+
+  # Hands the broker its TLS certificate, or reports that there is none. Never
+  # fails, so a missing certificate never stops the broker — see
+  # mosquitto/install-certificate.sh.
+  mosquitto-certs:
+    profiles: ["live-data"]
+    image: eclipse-mosquitto:2.1.2-alpine@sha256:6f8d8a947c506f8a2290ec65cd4bd2bc7cb4d43fb5f6271f861cb013e2ef9797
+    # ROOT on purpose (the image default): Let's Encrypt keeps every privkey 0600
+    # root. The copy it writes is owned by uid 1883, the broker's user.
+    entrypoint: ["/bin/sh", "/mosquitto-scripts/install-certificate.sh"]
+    environment:
+      - BROKER_PUBLIC_HOST=${LIVE_DATA_BROKER_PUBLIC_HOST:-}
+    volumes:
+      - ./mosquitto:/mosquitto-scripts:ro
+      # The directory certbot writes the web certificate to. The broker's is a
+      # separate lineage in it, issued by `./docker-stack.sh mqtt-cert`.
+      - ./nginx/certs:/letsencrypt:ro
+      - mosquitto_tls:/mosquitto/tls
+    network_mode: none
+
+  # Creates dynamic-security.json, once. It MUST precede the broker: on 2.1.x a
+  # missing file makes the broker invent a democlient and a super-admin, with
+  # their passwords in a plaintext .pw file, and still look healthy.
+  mosquitto-init:
+    profiles: ["live-data"]
+    image: eclipse-mosquitto:2.1.2-alpine@sha256:6f8d8a947c506f8a2290ec65cd4bd2bc7cb4d43fb5f6271f861cb013e2ef9797
+    user: "1883:1883"
+    entrypoint: ["/bin/sh", "/mosquitto-scripts/dynsec-init.sh"]
+    environment:
+      - MOSQUITTO_DYNSEC_USER=${MOSQUITTO_DYNSEC_USER:-}
+      - MOSQUITTO_DYNSEC_PASSWORD=${MOSQUITTO_DYNSEC_PASSWORD:-}
+    volumes:
+      - ./mosquitto:/mosquitto-scripts:ro
+      - mosquitto_data:/mosquitto/data
+    network_mode: none
+
+  mosquitto:
+    profiles: ["live-data"]
+    # 2.1.2 by digest, and the LINE is load-bearing, not the pin hygiene: `%u`
+    # in dynsec ACLs arrived in 2.1.0 (see mosquitto/mosquitto.conf). The 2.1
+    # line is published only `-alpine`; `eclipse-mosquitto:2.1.2` does not exist.
+    image: eclipse-mosquitto:2.1.2-alpine@sha256:6f8d8a947c506f8a2290ec65cd4bd2bc7cb4d43fb5f6271f861cb013e2ef9797
+    restart: unless-stopped
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      # NAMED, never bind-mounted: uid 1883 must own it, and a root-owned bind
+      # mount makes Mosquitto log an error and carry on without persistence. It
+      # holds dynamic-security.json — every enrolled device's credential —
+      # which mosquitto-backup copies into backups/ with the database dumps.
+      - mosquitto_data:/mosquitto/data
+      - mosquitto_tls:/mosquitto/tls:ro
+    ports:
+      # TLS, the device listener. The platform's first inbound opening besides
+      # 80/443: allow 8883/tcp in the host firewall. 1883 is the plaintext
+      # in-network listener and must NEVER be published.
+      - "8883:8883"
+    networks:
+      - mqtt
+    # `log_type all` (mosquitto.conf) is the only way an ACL denial shows at
+    # all; this keeps it from filling the disk.
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    # NO HEALTHCHECK, deliberately: the obvious probe needs the dynsec admin's
+    # credentials, and if they expand empty it hits `allow_anonymous false` and
+    # the container is permanently unhealthy.
+    depends_on:
+      mosquitto-init:
+        condition: service_completed_successfully
+      mosquitto-certs:
+        condition: service_completed_successfully
+
+  # The three dynsec roles (device, ingest, reaper) and the ingest client,
+  # created against the running broker on every start. See
+  # mosquitto/dynsec-roles.sh.
+  mosquitto-roles:
+    profiles: ["live-data"]
+    image: eclipse-mosquitto:2.1.2-alpine@sha256:6f8d8a947c506f8a2290ec65cd4bd2bc7cb4d43fb5f6271f861cb013e2ef9797
+    entrypoint: ["/bin/sh", "/mosquitto-scripts/dynsec-roles.sh"]
+    environment:
+      - MOSQUITTO_DYNSEC_USER=${MOSQUITTO_DYNSEC_USER:-}
+      - MOSQUITTO_DYNSEC_PASSWORD=${MOSQUITTO_DYNSEC_PASSWORD:-}
+      - MQTT_INGEST_USERNAME=${MQTT_INGEST_USERNAME:-live-data-ingest}
+      - MQTT_INGEST_PASSWORD=${MQTT_INGEST_PASSWORD:-}
+    volumes:
+      - ./mosquitto:/mosquitto-scripts:ro
+    networks:
+      - mqtt
+    depends_on:
+      mosquitto:
+        condition: service_started
+
+  live-data:
+    profiles: ["live-data"]
+    image: ghcr.io/optimce/live-data:main-prod
+    restart: unless-stopped
+    environment:
+      # ENV=production makes the service check its configuration at boot and
+      # refuse to start — one missing key per restart — without a non-wildcard
+      # ALLOW_ORIGIN, MQTT_ADMIN_USERNAME/PASSWORD, a BROKER_PUBLIC_HOST that is
+      # not MQTT_HOST, BROKER_PUBLIC_TLS=true and LOGGING_TOKEN/LOGS/METRICS.
+      - ENV=production
+      - CRM_DATABASE_URL=postgresql+asyncpg://live_data_svc:${LIVE_DATA_DB_PASSWORD:-}@postgres:5432/crm_db
+      - LOCAL_DATABASE_URL=postgresql+asyncpg://live_data_svc:${LIVE_DATA_DB_PASSWORD:-}@postgres:5432/live_data_local
+      # Pinned, not inherited: the coded default is 20+10 per pool, and the
+      # max_connections arithmetic on `postgres` counts 5+5.
+      - CRM_DB_POOL_SIZE=5
+      - CRM_DB_MAX_OVERFLOW=5
+      - LOCAL_DB_POOL_SIZE=5
+      - LOCAL_DB_MAX_OVERFLOW=5
+      - ALLOW_ORIGIN=${APP_CORS_ALLOWED_ORIGIN}
+      # The address this service DIALS: the in-network plaintext listener.
+      # Never handed to a device.
+      - MQTT_HOST=mosquitto
+      - MQTT_PORT=1883
+      - MQTT_TLS=false
+      # The dynsec admin: enrolment, revocation, and (holding the `reaper` role)
+      # clearing a revoked device's retained status. Only this container has it.
+      - MQTT_ADMIN_USERNAME=${MOSQUITTO_DYNSEC_USER:-}
+      - MQTT_ADMIN_PASSWORD=${MOSQUITTO_DYNSEC_PASSWORD:-}
+      # The address a device is TOLD. It goes into the device's flash at
+      # enrolment and is never asked for again: changing it later means
+      # visiting every installation. Decided once (D-3): mqtt.optimce.be, 8883,
+      # TLS. BROKER_PUBLIC_TLS is not a variable — production refuses false.
+      - BROKER_PUBLIC_HOST=${LIVE_DATA_BROKER_PUBLIC_HOST:-}
+      - BROKER_PUBLIC_PORT=${LIVE_DATA_BROKER_PUBLIC_PORT:-8883}
+      - BROKER_PUBLIC_TLS=true
+      - LOGGING_TOKEN=${LOGGING_TOKEN}
+      - LOGGING_TRACES_URL=${LOGGING_TRACES_URL}
+      - LOGGING_LOGS_URL=${LOGGING_LOGS_URL}
+      - LOGGING_METRICS_URL=${LOGGING_METRICS_URL}
+    networks:
+      - api-gateway
+      - database
+      - mqtt
+      - opentelemetry
+    depends_on:
+      postgres:
+        condition: service_healthy
+      postgres-init:
+        condition: service_completed_successfully
+      # `service_started`, NOT a healthcheck and NOT mosquitto-roles: a broker
+      # that is down is a 503 on enrolment, not a dead admin surface.
+      mosquitto:
+        condition: service_started
+    healthcheck:
+      # /health/readiness reads schema_version and compares it with the version
+      # the image expects, so it is red over an empty or stale live_data_local
+      # instead of green over no tables. It does not gate on the broker.
+      test:
+        - "CMD-SHELL"
+        - "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health/readiness', timeout=3).status==200 else 1)\""
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 45s
+
+  live-data-worker:
+    profiles: ["live-data"]
+    image: ghcr.io/optimce/live-data:main-worker
+    restart: unless-stopped
+    environment:
+      - ENV=production
+      - CRM_DATABASE_URL=postgresql+asyncpg://live_data_svc:${LIVE_DATA_DB_PASSWORD:-}@postgres:5432/crm_db
+      - LOCAL_DATABASE_URL=postgresql+asyncpg://live_data_svc:${LIVE_DATA_DB_PASSWORD:-}@postgres:5432/live_data_local
+      - CRM_DB_POOL_SIZE=5
+      - CRM_DB_MAX_OVERFLOW=5
+      - LOCAL_DB_POOL_SIZE=5
+      - LOCAL_DB_MAX_OVERFLOW=5
+      - ALLOW_ORIGIN=${APP_CORS_ALLOWED_ORIGIN}
+      - MQTT_HOST=mosquitto
+      - MQTT_PORT=1883
+      - MQTT_TLS=false
+      # The worker connects as the INGEST client, NOT as the dynsec admin. The
+      # admin's role grants publish on $$CONTROL/... and nothing on ce/#, so it
+      # would SUBSCRIBE successfully, get a normal SUBACK, and receive nothing at
+      # all — for ever, with no error anywhere.
+      - MQTT_INGEST_USERNAME=${MQTT_INGEST_USERNAME:-live-data-ingest}
+      - MQTT_INGEST_PASSWORD=${MQTT_INGEST_PASSWORD:-}
+      # Placeholders, NOT the admin's credentials. The production check in
+      # core/config.py is shared by all three entrypoints and refuses to boot
+      # without a non-empty MQTT_ADMIN_USERNAME/PASSWORD, but only the API
+      # (main.py) ever opens the dynsec control connection. This container
+      # parses untrusted device payloads and must not hold the one credential
+      # that can mint or revoke any device. Verified to boot on these values.
+      - MQTT_ADMIN_USERNAME=not-used-by-this-container
+      - MQTT_ADMIN_PASSWORD=not-used-by-this-container
+      - LOGGING_TOKEN=${LOGGING_TOKEN}
+      - LOGGING_TRACES_URL=${LOGGING_TRACES_URL}
+      - LOGGING_LOGS_URL=${LOGGING_LOGS_URL}
+      - LOGGING_METRICS_URL=${LOGGING_METRICS_URL}
+    # NO compose healthcheck: Dockerfile.worker carries its own, on the mtime of
+    # /tmp/worker.alive, which worker/main.py touches only while the broker
+    # connection is up — so a worker that cannot ingest is restarted rather than
+    # reporting healthy for ever.
+    #
+    # ONE REPLICA, deliberately. Two workers on the fixed client id
+    # live-data-ingest kick each other off the broker for ever, both healthy.
+    networks:
+      - database
+      - mqtt
+      - opentelemetry
+    depends_on:
+      postgres:
+        condition: service_healthy
+      postgres-init:
+        condition: service_completed_successfully
+      # The `ingest` role must exist before the worker subscribes: without it the
+      # SUBSCRIBE is granted and nothing is ever delivered.
+      mosquitto-roles:
+        condition: service_completed_successfully
+
+  # Rollups every 15 minutes, the ownership projection hourly, partitions and
+  # retention nightly. Same image as the worker, different entrypoint, and a
+  # separate container on purpose: the worker's healthcheck kills it 60 s into a
+  # broker outage, which must never interrupt a partition ATTACH or a retention
+  # DROP. It has no broker at all.
+  live-data-scheduler:
+    profiles: ["live-data"]
+    image: ghcr.io/optimce/live-data:main-worker
+    restart: unless-stopped
+    command: ["python", "-m", "worker.scheduler_main"]
+    environment:
+      - ENV=production
+      - CRM_DATABASE_URL=postgresql+asyncpg://live_data_svc:${LIVE_DATA_DB_PASSWORD:-}@postgres:5432/crm_db
+      - LOCAL_DATABASE_URL=postgresql+asyncpg://live_data_svc:${LIVE_DATA_DB_PASSWORD:-}@postgres:5432/live_data_local
+      - CRM_DB_POOL_SIZE=5
+      - CRM_DB_MAX_OVERFLOW=5
+      - LOCAL_DB_POOL_SIZE=5
+      - LOCAL_DB_MAX_OVERFLOW=5
+      - ALLOW_ORIGIN=${APP_CORS_ALLOWED_ORIGIN}
+      # Placeholders for the shared boot check — see live-data-worker.
+      - MQTT_ADMIN_USERNAME=not-used-by-this-container
+      - MQTT_ADMIN_PASSWORD=not-used-by-this-container
+      - LOGGING_TOKEN=${LOGGING_TOKEN}
+      - LOGGING_TRACES_URL=${LOGGING_TRACES_URL}
+      - LOGGING_LOGS_URL=${LOGGING_LOGS_URL}
+      - LOGGING_METRICS_URL=${LOGGING_METRICS_URL}
+    # MANDATORY OVERRIDE, not a refinement. The image bakes a healthcheck on
+    # /tmp/worker.alive, which this process never writes: without this block the
+    # container is unhealthy from its first probe onwards while doing its job.
+    # This heartbeat is ungated: a database outage makes each job log and the
+    # next tick retry, where a restart loop would leave the scheduler down at the
+    # moment the database comes back.
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "python -c \"import os, time, sys; sys.exit(0 if time.time() - os.path.getmtime('/tmp/scheduler.alive') < 60 else 1)\""
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+    networks:
+      - database
+      - opentelemetry
+    # NO mosquitto dependency of any kind: the rollups have nothing to do with
+    # the broker. Replicas would be safe (every job takes an advisory lock
+    # first) but buy nothing at this size.
+    depends_on:
+      postgres:
+        condition: service_healthy
+      postgres-init:
+        condition: service_completed_successfully
+
+  # ============================================
   # MIGRATION PROFILE - CRM schema migrations
   # ============================================
   # Runs as crm_svc, NOT as the superuser. That is deliberate: ALTER DEFAULT
@@ -1421,6 +1763,46 @@ services:
       - DOMAIN_HOST=${DOMAIN_HOST}
       - SSL_EMAIL=${SSL_EMAIL}
 
+  # The MQTT broker's certificate: a SEPARATE lineage from the web certificate
+  # (plan §15.1, D-3), in the same directory. Its own profile so that `start`
+  # never runs it: issued once by `./docker-stack.sh mqtt-cert`, renewed with
+  # every other lineage by `./docker-stack.sh renew-certs` — `certbot renew`
+  # replays the flags stored at issuance, so the two below stick.
+  #
+  #   --key-type rsa                    the path to ISRG Root X1 is the RSA one
+  #   --preferred-chain "ISRG Root X1"  (Root YR, cross-signed by X1). Devices
+  #                                     embed X1 and X2 (protocol §6, D-4b); the
+  #                                     server pins X1 (D-4a). X1 is trusted until
+  #                                     2030-06-04 — the fleet's end-of-life date.
+  #
+  # The HTTP-01 challenge is served by the reverse proxy on port 80, from the
+  # same webroot as the web certificate's: the DNS record for the broker
+  # hostname must point at this host first.
+  certbot-mqtt:
+    profiles: ["certs"]
+    image: certbot/certbot:latest
+    volumes:
+      - ./nginx/certs:/etc/letsencrypt
+      - ./nginx/certbot-webroot:/webroot
+    command:
+      - certonly
+      - --webroot
+      - -w
+      - /webroot
+      - -d
+      - ${LIVE_DATA_BROKER_PUBLIC_HOST:-}
+      - --cert-name
+      - ${LIVE_DATA_BROKER_PUBLIC_HOST:-}
+      - --key-type
+      - rsa
+      - --preferred-chain
+      - ISRG Root X1
+      - --keep-until-expiring
+      - --agree-tos
+      - -m
+      - ${SSL_EMAIL}
+      - --non-interactive
+
   crm-frontend:
     profiles: ["frontend"]
     image: ghcr.io/optimce/crm-frontend:main
@@ -1458,7 +1840,7 @@ services:
         TS=$$(date +%Y%m%d_%H%M%S) ;
         rc=0 ;
         pg_dumpall --globals-only -f /backups/globals_$$TS.sql || rc=1 ;
-        for pair in crm_db:crm_db allocation_key_local:allocation_key simulation_key_local:simulation_key news_board_local:news_board billing_local:billing administrative_document_local:administrative_document ; do
+        for pair in crm_db:crm_db allocation_key_local:allocation_key simulation_key_local:simulation_key news_board_local:news_board billing_local:billing administrative_document_local:administrative_document live_data_local:live_data ; do
           db=$${pair%%:*} ; name=$${pair##*:} ;
           echo "dumping $$db" ;
           pg_dump -d "$$db" -f "/backups/$${name}_$$TS.sql" || { echo "$$db FAILED" ; rc=1 ; } ;
@@ -1481,6 +1863,29 @@ services:
       '
     networks:
       - keycloak
+
+  # The broker's dynamic-security.json: every enrolled device's credential, plus
+  # the roles and the ingest client. It is not in any database, so no dump above
+  # has it — and losing it means re-enrolling the whole fleet by hand, on devices
+  # with no keyboard (plan §15.3). A plain copy is consistent: the dynsec plugin
+  # rewrites the file whole on every mutating command. Read-only mount; the
+  # broker may keep running. Restore: docs/runbooks/live-data.md.
+  mosquitto-backup:
+    profiles: ["backup"]
+    image: eclipse-mosquitto:2.1.2-alpine@sha256:6f8d8a947c506f8a2290ec65cd4bd2bc7cb4d43fb5f6271f861cb013e2ef9797
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        TS=$$(date +%Y%m%d_%H%M%S)
+        if [ -f /mosquitto/data/dynamic-security.json ]; then
+          cp /mosquitto/data/dynamic-security.json /backups/mosquitto_dynsec_$$TS.json && echo "copied dynamic-security.json"
+        else
+          echo "no dynamic-security.json - live-data has never run here, nothing to back up"
+        fi
+    volumes:
+      - mosquitto_data:/mosquitto/data:ro
+      - ./backups:/backups
+    network_mode: none
 
 volumes:
   # The unified application instance.
@@ -1508,6 +1913,12 @@ volumes:
   nats_data:
   krakend_config:
   keycloak_data:
+  # The broker's session store AND dynamic-security.json (every device's
+  # credential). Never `down -v` it; mosquitto-backup copies the JSON out.
+  mosquitto_data:
+  # The broker's copy of its TLS certificate, owned by uid 1883. Rebuilt from
+  # nginx/certs by mosquitto-certs on every start; safe to lose.
+  mosquitto_tls:
 
 networks:
   reverse-proxy:
@@ -1560,3 +1971,9 @@ networks:
   # trusts x-user-id blindly - so a compromised static frontend must never be able
   # to resolve it.
   sse:
+  # The broker's PLAINTEXT listener (1883). Membership is the access list:
+  # mosquitto, mosquitto-roles, live-data (the dynsec control connection) and
+  # live-data-worker (ingest) — nothing else. Devices never touch this network;
+  # they reach the published TLS port 8883. The scheduler is deliberately not on
+  # it: it has no reason to reach the broker.
+  mqtt:

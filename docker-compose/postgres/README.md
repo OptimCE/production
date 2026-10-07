@@ -1,6 +1,6 @@
 # The unified Postgres instance
 
-One PostgreSQL instance (compose service `postgres`) holds six logical databases,
+One PostgreSQL instance (compose service `postgres`) holds seven logical databases,
 each owned by its own login role. `keycloak-db` remains a separate instance — see
 [Why Keycloak is not here](#why-keycloak-is-not-here).
 
@@ -12,8 +12,16 @@ each owned by its own login role. `keycloak-db` remains a separate instance — 
 | `news_board_local` | `news_board_svc` | news-board | `NEWS_BOARD_DB_PASSWORD` |
 | `billing_local` | `billing_svc` | billing (+ worker) | `BILLING_DB_PASSWORD` |
 | `administrative_document_local` | `administrative_document_svc` | administrative-document (+ worker) | `ADMINISTRATIVE_DOCUMENT_DB_PASSWORD` |
+| `live_data_local` | `live_data_svc` | live-data (+ worker, scheduler) | `LIVE_DATA_DB_PASSWORD` |
 
-Plus a **seventh role that owns no database**: `notification_dispatch_svc`
+`live_data_local` is provisioned whether or not the `live-data` profile runs, so the
+isolation matrix is the same everywhere. An empty `LIVE_DATA_DB_PASSWORD` does not fail
+provisioning: Postgres answers "empty string is not a valid password, clearing
+password", and the role simply cannot log in — a half-configured live-data never
+costs the platform. Its baseline embodies `schema_version` 4; `optimce-migrator` does
+not manage this database yet, so its first schema change needs a migrator entry.
+
+Plus an **eighth role that owns no database**: `notification_dispatch_svc`
 (`NOTIFICATION_DISPATCH_DB_PASSWORD`). notification-dispatch's queue is
 `outbound_message`, which lives in the CRM schema so that a producer's enqueue
 rides on that producer's own transaction. So the role exists purely to hold two
@@ -37,6 +45,7 @@ as a **read-mostly** consumer. What "read-mostly" means is enforced by
 | `news_board_svc` | SELECT all; INSERT `audit_log`, `notification`, `outbound_message` |
 | `billing_svc` | SELECT all; INSERT `audit_log`, `notification`, `outbound_message` |
 | `administrative_document_svc` | SELECT all; INSERT `audit_log`, `notification`, `outbound_message` |
+| `live_data_svc` | SELECT all; INSERT `audit_log` (the only CRM write in its code) |
 | `notification_dispatch_svc` | SELECT all; **UPDATE** `outbound_message`; INSERT `email_suppression` |
 
 `notification_dispatch_svc` is the only role in the whole matrix holding an
@@ -144,8 +153,8 @@ Read-only (every statement is a SELECT), and it runs as the **superuser**, unlik
 the two scripts above: the isolation they prove means no service role can read
 across databases, and a survey needs to. Exit 0 = clean, 1 = `crm_db.meter.ean`
 has non-conforming rows (listed, with samples), 2 = a probe could not run. Every
-probe is guarded on its database and table existing, so `live_data_local`, which
-this deployment does not run, is simply skipped.
+probe is guarded on its database and table existing, so a `live_data_local` that
+has no tables yet is simply skipped.
 
 Run it before the migrator applies CRM migration 12, which adds
 `chk_meter_ean_18_digits` and **refuses** to while any `meter.ean` does not
@@ -174,7 +183,7 @@ with `provision/91-reown-crm.sql` followed by another `postgres-init` run.
 **Re-run `postgres-init` after any migrator run.** New tables arrive ungranted
 until it converges them.
 
-## Adding a seventh database
+## Adding another database
 
 Five mechanical edits:
 
@@ -202,7 +211,7 @@ recorded in that database's `schema_version`.
 Keycloak manages its own schema with an internal Liquibase at startup, and it is
 the one service whose failure locks everyone out of everything. Leaving it on
 `keycloak-db` keeps the identity provider out of the blast radius of this
-instance, and gives these seven roles no route to it at all — a stronger
+instance, and gives these eight roles no route to it at all — a stronger
 guarantee than a `REVOKE`.
 
 ## The accepted trade-off

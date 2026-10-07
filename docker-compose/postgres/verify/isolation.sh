@@ -72,6 +72,7 @@ pw_for() {
         billing_svc)                 printf '%s' "$BILLING_DB_PASSWORD" ;;
         administrative_document_svc) printf '%s' "$ADMINISTRATIVE_DOCUMENT_DB_PASSWORD" ;;
         notification_dispatch_svc)   printf '%s' "$NOTIFICATION_DISPATCH_DB_PASSWORD" ;;
+        live_data_svc)               printf '%s' "${LIVE_DATA_DB_PASSWORD:-}" ;;
         *) printf '' ;;
     esac
 }
@@ -83,16 +84,17 @@ simulation_key_svc|simulation_key_local
 news_board_svc|news_board_local
 billing_svc|billing_local
 administrative_document_svc|administrative_document_local
+live_data_svc|live_data_local
 notification_dispatch_svc|-'
 
-LOCAL_DBS='allocation_key_local simulation_key_local news_board_local billing_local administrative_document_local'
+LOCAL_DBS='allocation_key_local simulation_key_local news_board_local billing_local administrative_document_local live_data_local'
 
 # Every role that reaches crm_db without owning it.
-CRM_CONSUMERS='allocation_key_svc simulation_key_svc news_board_svc billing_svc administrative_document_svc notification_dispatch_svc'
+CRM_CONSUMERS='allocation_key_svc simulation_key_svc news_board_svc billing_svc administrative_document_svc live_data_svc notification_dispatch_svc'
 
-# The five that write an audit trail. notification_dispatch_svc is not one of
+# The six that write an audit trail. notification_dispatch_svc is not one of
 # them — it owns the delivery loop and nothing else.
-ANNEXES='allocation_key_svc simulation_key_svc news_board_svc billing_svc administrative_document_svc'
+ANNEXES='allocation_key_svc simulation_key_svc news_board_svc billing_svc administrative_document_svc live_data_svc'
 
 # ---------------------------------------------------------------------------
 echo
@@ -157,7 +159,7 @@ done
 
 echo
 echo '   ... and each narrow grant absent from every role that must not have it'
-for role in simulation_key_svc news_board_svc billing_svc administrative_document_svc notification_dispatch_svc; do
+for role in simulation_key_svc news_board_svc billing_svc administrative_document_svc live_data_svc notification_dispatch_svc; do
     pw=$(pw_for "$role")
     run fail "$role" "$pw" crm_db \
         "INSERT INTO allocation_key (name, description, id_community) VALUES ('_verify', '_verify', 1)" \
@@ -175,8 +177,9 @@ run fail notification_dispatch_svc "$(pw_for notification_dispatch_svc)" crm_db 
 # together the day an optimce-migrator release adds them.
 if crm_table_exists notification; then
     # Producers may INSERT; nobody else may, including the dispatcher that reads
-    # them. allocation-key and simulation-key have no notification port at all.
-    for role in allocation_key_svc simulation_key_svc notification_dispatch_svc; do
+    # them. allocation-key, simulation-key and live-data have no notification
+    # port at all.
+    for role in allocation_key_svc simulation_key_svc live_data_svc notification_dispatch_svc; do
         pw=$(pw_for "$role")
         run fail "$role" "$pw" crm_db \
             "INSERT INTO notification (id_user, type) VALUES (1, '_verify')" \

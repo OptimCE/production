@@ -5,13 +5,15 @@
 -- into something the database enforces, rather than something the code
 -- promises. Before consolidation every service reached crm_db as the superuser.
 --
--- Six roles reach crm_db without owning it:
+-- Seven roles reach crm_db without owning it:
 --
 --   allocation_key_svc          SELECT + audit + its own domain cascade
 --   simulation_key_svc          SELECT + audit
 --   news_board_svc              SELECT + audit + notifications
 --   billing_svc                 SELECT + audit + notifications
 --   administrative_document_svc SELECT + audit + notifications
+--   live_data_svc               SELECT + audit (core/audit_log only; checked:
+--                               no other statement reaches its CRM session)
 --   notification_dispatch_svc   SELECT + the delivery loop, and nothing else
 --
 -- notification_dispatch_svc is the odd one out in both directions: it owns no
@@ -53,7 +55,8 @@ GRANT USAGE ON SCHEMA public TO
     news_board_svc,
     billing_svc,
     administrative_document_svc,
-    notification_dispatch_svc;
+    notification_dispatch_svc,
+    live_data_svc;
 
 -- Not retroactive is the whole reason this runs on EVERY start rather than once:
 -- it covers tables that already existed when a role was added, and tables an
@@ -69,7 +72,8 @@ GRANT SELECT ON ALL TABLES IN SCHEMA public TO
     news_board_svc,
     billing_svc,
     administrative_document_svc,
-    notification_dispatch_svc;
+    notification_dispatch_svc,
+    live_data_svc;
 
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO
     allocation_key_svc,
@@ -77,7 +81,8 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO
     news_board_svc,
     billing_svc,
     administrative_document_svc,
-    notification_dispatch_svc;
+    notification_dispatch_svc,
+    live_data_svc;
 
 -- ---------------------------------------------------------------------------
 -- Writes — narrow, one row per verified call site, and every one of them
@@ -121,7 +126,7 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO
 -- than assuming it.
 --
 -- Call sites, for the record:
---   audit_log                            core/audit_log/service.py, all five annexes
+--   audit_log                            core/audit_log/service.py, all six annexes
 --   allocation_key, iteration, consumer  one ORM flush cascades into all three
 --                                        (allocation-key-generation only)
 --   notification, outbound_message       core/notifications/, producers only
@@ -134,7 +139,7 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO
 -- ---------------------------------------------------------------------------
 DO $$
 DECLARE
-    ANNEXES   CONSTANT text := 'allocation_key_svc, simulation_key_svc, news_board_svc, billing_svc, administrative_document_svc';
+    ANNEXES   CONSTANT text := 'allocation_key_svc, simulation_key_svc, news_board_svc, billing_svc, administrative_document_svc, live_data_svc';
     PRODUCERS CONSTANT text := 'news_board_svc, billing_svc, administrative_document_svc';
     DISPATCH  CONSTANT text := 'notification_dispatch_svc';
     g                  record;

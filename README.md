@@ -74,6 +74,8 @@ them into their final form (`prod-config.json`, `config.json`,
 | nats | JetStream message broker | internal |
 | redis | Realtime (SSE) ticket store and pub/sub bus | internal |
 | best-address | Self-hosted BeSt Address register (FPS BOSA) — the address picker. ~1.7 GB RAM | internal |
+| live-data | Live Data annexe API + ingest worker + scheduler (`live-data` profile) | http://localhost/api/live, device enrolment at /api/live-public/enroll |
+| mosquitto | MQTT broker for the live-data devices — TLS terminates here (`live-data` profile) | mqtts://${LIVE_DATA_BROKER_PUBLIC_HOST}:8883 |
 | reverse-proxy | NGINX reverse proxy | http://localhost |
 
 ## Commands
@@ -87,6 +89,8 @@ them into their final form (`prod-config.json`, `config.json`,
 ./docker-stack.sh migrate --dry-run  # Report what is pending, change nothing
 ./docker-stack.sh verify          # Prove database isolation and the CRM grants
 ./docker-stack.sh survey-ean      # Report stored EANs that are not 18 digits (read-only)
+./docker-stack.sh mqtt-cert       # Issue the MQTT broker's certificate, once (needs its DNS record)
+./docker-stack.sh renew-certs     # Renew every certificate due; reload nginx and the broker (cron)
 ./docker-stack.sh help            # Show usage
 ```
 
@@ -104,13 +108,18 @@ Docker Compose profiles control which services start:
 
 | Profile | Services | Purpose |
 |---------|----------|---------|
-| `init` | swagger-doc-gen, generation-doc-gen, simulation-doc-gen, news-board-doc-gen, billing-doc-gen, administrative-document-doc-gen, krakend-config, keycloak-config, nginx-config, crm-frontend-config, keycloak-group-id-mapper, keycloak-optimce-theme | One-shot config generators and provider downloads |
+| `init` | swagger-doc-gen, generation-doc-gen, simulation-doc-gen, news-board-doc-gen, billing-doc-gen, administrative-document-doc-gen, live-data-doc-gen, krakend-config, keycloak-config, nginx-config, crm-frontend-config, keycloak-group-id-mapper, keycloak-optimce-theme | One-shot config generators and provider downloads |
 | `backend` | postgres, postgres-init, keycloak-db, keycloak, keycloak-healthcheck, crm-backend, allocation-key-generation (+ worker), simulation-key (+ worker), news-board, billing (+ worker), administrative-document (+ worker), document-generation, notification-dispatch, nats, redis, best-address, minio, minio-init, krakend | Core infrastructure |
 | `frontend` | reverse-proxy, certbot, crm-frontend | Web serving layer |
+| `live-data` | mosquitto-certs, mosquitto-init, mosquitto, mosquitto-roles, live-data, live-data-worker, live-data-scheduler | The Live Data annexe and its MQTT broker — always combined with `backend` |
 | `migration` | optimce-migrator | One-shot schema migrations, all six databases |
-| `backup` | db-backup, keycloak-db-backup | Database backup services |
+| `backup` | db-backup, keycloak-db-backup, mosquitto-backup | Database dumps and the broker's device credentials |
+| `certs` | certbot-mqtt | The broker certificate's first issuance (`./docker-stack.sh mqtt-cert`) |
 
-Default startup runs `init`, then `backend`, then `frontend`.
+Default startup runs `init`, then `backend`, then `frontend`, then `live-data` — the last one
+**non-fatally**: a live-data failure is reported and leaves the rest of the platform running.
+The `live-data` profile must always be combined with `backend` (its services gate on
+`postgres-init`), and nothing outside it may depend on it.
 
 **Use `./docker-stack.sh migrate`**, not the raw compose commands. It does the same
 thing and then re-runs `postgres-init`, which is not optional: objects the migrator
@@ -143,7 +152,7 @@ later query then queues behind the migrator.
 
 ## Databases
 
-One PostgreSQL instance (`postgres`) holds all six application databases, each
+One PostgreSQL instance (`postgres`) holds all seven application databases, each
 owned by its own login role, with `PUBLIC` unable to connect to any of them.
 `keycloak-db` is deliberately a separate instance.
 
@@ -155,9 +164,10 @@ owned by its own login role, with `PUBLIC` unable to connect to any of them.
 | `news_board_local` | `news_board_svc` | news-board |
 | `billing_local` | `billing_svc` | billing (+ worker) |
 | `administrative_document_local` | `administrative_document_svc` | administrative-document (+ worker) |
+| `live_data_local` | `live_data_svc` | live-data (+ worker, scheduler) — provisioned even when the profile does not run |
 | `keycloak` | `postgres` | keycloak — **separate instance** |
 
-A seventh role, `notification_dispatch_svc`, owns no database: notification-dispatch's
+An eighth role, `notification_dispatch_svc`, owns no database: notification-dispatch's
 queue lives in the CRM schema so a producer's enqueue rides on its own transaction.
 
 Each annexe service also reaches `crm_db` as a read-mostly consumer; what it may
@@ -230,6 +240,35 @@ the commune centre to its actual roof. Two things to know before the first deplo
   `docker compose ps best-address` before believing the picker itself is at fault.
   Nothing gates on it: the API starts, and works, whether or not the register is up.
 
+## Live data (MQTT)
+
+The Live Data annexe ingests smart-meter telemetry over MQTT. It is the only part of the
+platform with public infrastructure of its own, so it lives in its own `live-data` profile,
+started **last and non-fatally**: whatever goes wrong there, the rest of the platform stays up.
+
+- **The broker** (`mosquitto`, Mosquitto 2.1.2 pinned by digest — the 2.1 line is
+  load-bearing) publishes **8883 only**, with TLS terminated inside it. The plaintext 1883
+  listener is reachable only on the `mqtt` network (the API, the ingest worker, the roles job).
+- **Its hostname is permanent.** `LIVE_DATA_BROKER_PUBLIC_HOST` (`mqtt.optimce.be`) is written
+  into every device at enrolment and can never be changed remotely. It needs its own DNS
+  record, its own certificate lineage (`./docker-stack.sh mqtt-cert`: RSA, chain pinned to
+  ISRG Root X1, trusted until **2030-06-04** — the fleet's end-of-life date) and 8883/tcp open
+  in the firewall.
+- **Without a certificate the broker still starts**, with no device listener;
+  `mosquitto-certs` says so in its log. That keeps a missing certificate from taking live-data
+  down with it.
+- **Renewal is not optional.** `./docker-stack.sh renew-certs` renews every lineage, reloads
+  nginx, refreshes the broker's copy and restarts the broker only if it changed. Run it from
+  cron (weekly); without it every device fails its handshake ~90 days in while the web app
+  looks perfectly fine.
+- **Device enrolment** (`POST /api/live-public/enroll`) is the platform's only unauthenticated
+  API route: an exact nginx location strips the five gateway-trust headers, rate-limits per IP
+  and caps the body at 4 KB.
+- **Show it to managers last**: `ANNEX_CATALOG_ENABLE=live-data`, then
+  `docker compose --profile backend up -d crm-backend`, once the profile is healthy.
+
+Procedure, troubleshooting, rotation and restore: [`docs/runbooks/live-data.md`](docs/runbooks/live-data.md).
+
 ## Automatic Backups
 
 Backups run automatically before `stop` or `restart`. `db-backup` dumps every
@@ -243,7 +282,11 @@ application database plus the cluster-wide role definitions in one job;
 - News-board → `backups/news_board_YYYYMMDD_HHMMSS.sql`
 - Billing → `backups/billing_YYYYMMDD_HHMMSS.sql`
 - Administrative-document → `backups/administrative_document_YYYYMMDD_HHMMSS.sql`
+- Live-data → `backups/live_data_YYYYMMDD_HHMMSS.sql`
 - Keycloak → `backups/keycloak_YYYYMMDD_HHMMSS.sql`
+- The MQTT broker's device credentials → `backups/mosquitto_dynsec_YYYYMMDD_HHMMSS.json`
+  (`mosquitto-backup`). Not in any database, and losing it means re-enrolling every
+  device by hand — treat it like the dumps: it holds every device's password hash.
 
 The globals dump is not optional: role definitions and their password hashes live
 in the instance, not in any single database, so a set of per-database dumps
@@ -256,6 +299,7 @@ Manual backup:
 ```bash
 docker compose -f docker-compose/docker-compose.yml --profile backup run --rm db-backup
 docker compose -f docker-compose/docker-compose.yml --profile backup run --rm keycloak-db-backup
+docker compose -f docker-compose/docker-compose.yml --profile backup run --rm mosquitto-backup
 ```
 
 Backups are stored in `docker-compose/backups/`.
@@ -284,6 +328,8 @@ published images, so they must be kept in sync when the corresponding service ch
 | `docker-compose/schemas/<annexe>.sql` | each annexe's `scripts/sql/schema.sql` | `postgres-init`, applied only to an **empty** database |
 | `docker-compose/document-templates/billing/` | `billing/document-templates/billing/` | seeded into the `optimce-templates` bucket by `minio-init` |
 | `docker-compose/document-templates/administrative-document/` | `administrative-document/document-templates/administrative-document/` | seeded into the same bucket by `minio-init` |
+| `docker-compose/schemas/live_data_local.sql` | `live-data/scripts/sql/schema.sql` | `postgres-init`, applied only to an **empty** `live_data_local` — it embodies `schema_version` 4, which the live-data image's readiness check compares against |
+| `docker-compose/mosquitto/mosquitto.conf` | monorepo `mosquitto/config/mosquitto.conf`, **except the listeners** (production adds the TLS one through `include_dir`) | `mosquitto` |
 
 The files under `docker-compose/schemas/` are disaster-recovery baselines, not
 migrations: `postgres-init` applies one only when its database has no table at
