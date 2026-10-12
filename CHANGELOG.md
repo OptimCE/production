@@ -141,8 +141,30 @@ and this project adheres to
   with `NOT VALID`: the offending meters would become read-only, and nothing can
   rewrite a meter's EAN. See `DEPLOYMENT_PLAN.md` Step 7 and
   `DATABASE_CONSOLIDATION.md` §9.13.
+- **Billing migration 3 — an invoice corrected by a credit note becomes CREDITED.**
+  The billing image of this release moves the invoice a credit note corrects to the
+  new terminal status `CREDITED` (7) when the credit note is issued: not payable,
+  never swept OVERDUE, out of every unpaid count. Migration 3 is the data-only
+  backfill for credit notes issued before it. Without it, those invoices stay
+  ISSUED/SENT/OVERDUE: still counted as unpaid, and the overdue sweep can still mail
+  the member that the corrected bill "remains unpaid". A DRAFT or CANCELLED credit
+  note credits nothing. No notification is sent for the backfilled rows.
+  - **Run it with `billing` stopped or already on the new image**, as `stop`,
+    `migrate`, `start` does. The previous image does not know status 7: it still
+    accepts a second credit note against such an invoice, and a forced re-render of
+    one answers 500.
+  - Preview the count before the window (read-only, `billing_local`): the
+    `UPDATE … FROM` in `optimce-migrator/migrations/billing/003_invoice_credited_status.sql`
+    as a `SELECT count(*)`.
+- **CRM migration 13 — `municipality_postal_code.created_at`.** The crm-backend
+  entity declares it and migration 2 creates it, but the CRM base schema did not,
+  and migration 2 is `CREATE TABLE IF NOT EXISTS`: a CRM stood up from
+  `schemas/crm_db.sql` never got the column, and every municipality read that loads
+  postal codes failed there. `ADD COLUMN IF NOT EXISTS`, so a no-op wherever
+  migration 2 created the table; online-safe (a catalogue update, no rewrite).
 - `docker-compose/schemas/crm_db.sql` re-vendored from the monorepo, carrying the
   same address block and, since migration 12, `chk_meter_ean_18_digits` on `meter`.
+  Since migration 13 it also creates `municipality_postal_code.created_at`.
   **Inert for the running deployment** — `postgres-init` applies
   a baseline only to a database with no relations — but it is what stops a
   rebuild-from-empty landing one migration short, permanently and with no way to
@@ -244,6 +266,32 @@ and this project adheres to
 
 ### Fixed
 
+- **The two solver workers have a memory ceiling.** `allocation-key-generation-worker`
+  gets `mem_limit: 2g` and `simulation-key-worker` gets `2560m`, each with swap capped
+  at the same value. Without them a solve that outgrew the host was OOM-killed by
+  the host kernel, which could take any other container on this host with it.
+  - The images of this release are sized for these limits. allocation-key-generation
+    refuses a generation over 400,000 participants x timesteps, and simulation-key
+    refuses a run over 5,000,000 participants x timesteps x iterations.
+  - A solver process killed for memory is retried a bounded number of times, then
+    the run fails as `solver_crashed`. It is not redelivered forever.
+  - Read each service's README, "Resource sizing", before raising either limit.
+- **NATS workers get 60 s to stop, not Docker's default 10.** On SIGTERM a worker
+  waits up to 25 s for in-flight runs to finish and ack. Then it drains NATS and
+  flushes telemetry. At 10 s, every `stop` / `restart` SIGKILLed it mid-drain, and
+  an interrupted run was solved or rendered again after its `ack_wait`.
+  - This applies to `stop_grace_period` on `allocation-key-generation-worker`,
+    `simulation-key-worker`, `document-generation`, `billing-worker` and
+    `administrative-document-worker`.
+  - `docker-stack.sh stop` honours it, because `compose down` reads each service's
+    grace period. Only a worker that is actually busy uses the extra time.
+- **`krakend`, `reverse-proxy` and `crm-frontend` restart on their own.** All three
+  had no `restart:` policy, unlike every other long-running service here. After a
+  host reboot, a Docker daemon restart or a crash, the gateway, the public entry
+  point and the SPA stayed down until someone ran `start`.
+  - They now use `unless-stopped`.
+  - nginx resolves its upstreams at start. A reverse proxy that comes up before
+    them exits and is restarted until they resolve.
 - **`minio-init` moved from `minio/mc` to `pgsty/mc`**, pinned by digest. `minio/mc`
   on Docker Hub (and `quay.io/minio/mc`) no longer serves anonymous pulls
   ("repository does not exist"), so every `docker compose pull` of the backend

@@ -619,6 +619,9 @@ services:
     # a swagger2krakend release that emits version 4; .github/renovate.json holds
     # the major bump back until then.
     image: krakend:2.13.11@sha256:26eb32dbb0e679c62170b21b4efb0729dc00262afd98fe6210110dbbbdd6425f
+    # Without a restart policy the gateway, and with it every /api route,
+    # stayed down after a host reboot, a Docker daemon restart or a crash.
+    restart: unless-stopped
     volumes:
       - ./krakend_config:/etc/krakend
     networks:
@@ -842,6 +845,21 @@ services:
     image: ghcr.io/optimce/allocation-key-generation:main-worker
     restart: unless-stopped
     cpus: "2.0"
+    # One solver process (cpus - 1). OLAGSA refuses generations over 400,000
+    # participants x timesteps, which keeps a solve near 1 GB, plus ~0.3 GB for
+    # the worker itself; brute_force peaks near 0.2 GB at that limit. A solver
+    # killed for memory is retried a bounded number of times. Swap capped at
+    # the same value so a runaway solve is killed instead of thrashing the
+    # host. See allocation-key-generation's README, "Resource sizing".
+    mem_limit: 2g
+    memswap_limit: 2g
+    # 60 s to stop, not Docker's default 10. On SIGTERM the worker waits up to
+    # 25 s for in-flight runs to finish and ack, then drains its subscription
+    # and the NATS connection and flushes telemetry. At 10 s every
+    # `docker-stack.sh stop` / `restart` SIGKILLed it mid-drain, and an
+    # interrupted run was redelivered and solved again after its ack_wait.
+    # Same on the four other NATS workers below.
+    stop_grace_period: 60s
     environment:
       - ENV=production
       - CRM_DATABASE_URL=postgresql+asyncpg://allocation_key_svc:${ALLOCATION_KEY_DB_PASSWORD}@postgres:5432/crm_db
@@ -949,6 +967,16 @@ services:
     image: ghcr.io/optimce/allocation-key-simulation:main-worker
     restart: unless-stopped
     cpus: "2.0"
+    # One solver process (cpus - 1). simulation-key refuses runs over
+    # 5,000,000 participants x timesteps x iterations; at that limit the worker
+    # peaked at 1.9 GB, page cache included (2026-10-09). A solver process is the
+    # kernel's first OOM victim, and its crash is retried a bounded number of
+    # times; swap capped at the same value so a runaway solve is killed instead
+    # of thrashing the host. See simulation-key's README, "Resource sizing".
+    mem_limit: 2560m
+    memswap_limit: 2560m
+    # See allocation-key-generation-worker: 25 s in-flight drain on SIGTERM.
+    stop_grace_period: 60s
     environment:
       - ENV=production
       - CRM_DATABASE_URL=postgresql+asyncpg://simulation_key_svc:${SIMULATION_KEY_DB_PASSWORD}@postgres:5432/crm_db
@@ -1047,6 +1075,8 @@ services:
     profiles: ["backend"]
     image: ghcr.io/optimce/document-generation:main-worker
     restart: unless-stopped
+    # See allocation-key-generation-worker: 25 s in-flight drain on SIGTERM.
+    stop_grace_period: 60s
     environment:
       - ENV=production
       - NATS_URL=nats://nats:4222
@@ -1134,6 +1164,8 @@ services:
     profiles: ["backend"]
     image: ghcr.io/optimce/billing:main-worker
     restart: unless-stopped
+    # See allocation-key-generation-worker: 25 s in-flight drain on SIGTERM.
+    stop_grace_period: 60s
     environment:
       - ENV=production
       - CRM_DATABASE_URL=postgresql+asyncpg://billing_svc:${BILLING_DB_PASSWORD}@postgres:5432/crm_db
@@ -1265,6 +1297,8 @@ services:
     profiles: ["backend"]
     image: ghcr.io/optimce/administrative-document:main-worker
     restart: unless-stopped
+    # See allocation-key-generation-worker: 25 s in-flight drain on SIGTERM.
+    stop_grace_period: 60s
     environment:
       - ENV=production
       - CRM_DATABASE_URL=postgresql+asyncpg://administrative_document_svc:${ADMINISTRATIVE_DOCUMENT_DB_PASSWORD}@postgres:5432/crm_db
@@ -1739,6 +1773,11 @@ services:
   reverse-proxy:
     profiles: ["frontend"]
     image: nginx:latest
+    # Without a restart policy the public entry point stayed down after a host
+    # reboot, a Docker daemon restart or a crash. nginx resolves its upstreams
+    # (crm-backend, krakend, keycloak, ...) at start: started before them, it
+    # exits and is restarted until they resolve.
+    restart: unless-stopped
     ports:
       - "80:80"
       - "443:443"
@@ -1813,6 +1852,9 @@ services:
   crm-frontend:
     profiles: ["frontend"]
     image: ghcr.io/optimce/crm-frontend:main
+    # Without a restart policy the SPA stayed down after a host reboot, a
+    # Docker daemon restart or a crash.
+    restart: unless-stopped
     volumes:
       - ./crm-frontend-config/config.json:/usr/share/nginx/html/assets/config/config.json
     networks:
