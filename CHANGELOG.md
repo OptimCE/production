@@ -107,6 +107,40 @@ and this project adheres to
   silently never be offered** and the register would freeze at whatever week was
   pinned the day this landed.
 
+### Added (the GRD prefill: internal `dso-lookup`)
+
+- **`dso-lookup`** (`ghcr.io/optimce/dso-lookup:main-prod`, `backend` profile): which
+  network operator (GRD) serves a Belgian address, from the `belgian-dso-map` data
+  release baked into the image (2026.10.0, CC BY 4.0). crm-backend calls it to prefill
+  the GRD of a new meter. **Internal, not an annex**: no KrakenD route, no doc-gen, no
+  `krakend-builder.yaml` entry, and it must **never** be named in `ANNEX_CATALOG_*` (a
+  name the catalogue does not contain refuses crm-backend's boot). The gateway exposes
+  only crm-backend's own `GET /dso/operators` and `GET /dso/resolve`, which arrive
+  through crm-backend's swagger.
+  - A dedicated `dso-lookup` network that crm-backend joins. It also joins
+    `opentelemetry` for its telemetry, where the annex services can resolve it too:
+    tolerated, since it serves only public read-only reference data and logs no query
+    parameter (`--no-access-log`).
+  - `ENV=production` refuses to boot without `LOGGING_TOKEN`, `LOGGING_LOGS_URL` and
+    `LOGGING_METRICS_URL`. Healthcheck on `/health/readiness`, red until the data has
+    loaded and checked out. No published port.
+  - **The GHCR package must be public**, and pullable before this compose file reaches
+    the host: `start` pulls the whole `backend` profile in one command and stops at the
+    first image it cannot pull.
+  - Pulling `:main-prod` **is** the data refresh. A new data release arrives as the
+    weekly bump pull request in `OptimCE/dso-lookup`, reviewed there.
+- **`DSO_LOOKUP_URL`** (default `http://dso-lookup:8000`) and **`DSO_LOOKUP_TIMEOUT_MS`**
+  (1000) on crm-backend and in `.env.example`. The `-` form, not `:-`: a **blank** value
+  is the off switch, deleting the line is not. Off or down, `GET /dso/resolve` answers
+  200 with `status: unavailable`, `GET /dso/operators` answers `[]`, and the meter form
+  keeps its plain GRD select; creating a meter never calls the service, so there is no
+  `depends_on`. 1000 ms because one resolve makes at most two sequential calls inside
+  KrakenD's 3000 ms budget. crm-backend logs `dso-lookup client registered` at boot,
+  then `dso-lookup reachable` or `dso-lookup not reachable at boot - the GRD prefill
+  will retry per request`.
+- README: "Internal services are not annexes", the service table and profile list,
+  and the first-deployment order (pull, stop, migrate 14, start, gateway check).
+
 ### Added (migrations)
 
 - **CRM migration 11 — house numbers become text, plus the BeSt link.**
@@ -162,9 +196,28 @@ and this project adheres to
   `schemas/crm_db.sql` never got the column, and every municipality read that loads
   postal codes failed there. `ADD COLUMN IF NOT EXISTS`, so a no-op wherever
   migration 2 created the table; online-safe (a catalogue update, no rewrite).
+- **CRM migration 14 — `meter_data.grd` stores stable ids, with its provenance.**
+  Adds `grd_source` (`auto` = kept what dso-lookup prefilled, `manual`, NULL = older
+  than this migration) and `grd_data_version` (the data release of an `auto` value),
+  and rewrites every legacy display name to its stable id ("ORES" → `ores`,
+  "Fluvius Imewo" → `fluvius-imewo`; trimmed, case- and hyphen-insensitive). Anything
+  else, a bare "Fluvius" included, is left as is. No CHECK: `grd` stays free text.
+  - **Apply it before the new crm-backend image.** The `MeterData` entity declares both
+    columns and TypeORM selects them by name: on the old schema every meter read
+    answers 500. The previous image never names them and keeps working on the
+    migrated table.
+  - **The rewrite is irreversible**, and the previous crm-frontend matches the GRD
+    select by display name: between this migration and the new SPA, an edited meter
+    shows an empty GRD. `stop`, `migrate`, `start` leaves no such window.
+  - Its first run bumps `meter_data.updated_at` on every rewritten row (the
+    `update_meter_data_modtime` trigger); a replay touches nothing.
+  - Online-safe (two catalogue-only `ADD COLUMN`s, an UPDATE of the changed rows only,
+    5-second `lock_timeout`). Its header holds a read-only report of the values that
+    are not ids yet: run it before and after.
 - `docker-compose/schemas/crm_db.sql` re-vendored from the monorepo, carrying the
   same address block and, since migration 12, `chk_meter_ean_18_digits` on `meter`.
   Since migration 13 it also creates `municipality_postal_code.created_at`.
+  Since migration 14 it also creates `meter_data.grd_source` and `grd_data_version`.
   **Inert for the running deployment** — `postgres-init` applies
   a baseline only to a database with no relations — but it is what stops a
   rebuild-from-empty landing one migration short, permanently and with no way to
@@ -377,6 +430,41 @@ and this project adheres to
   which would break `--profile frontend up -d` outright.
 
 ### Notes
+
+- **2026-10-19 wave: the NATS workers reconcile their durable consumers.** A durable
+  keeps the config it was created with, so the billing, administrative-document,
+  document-generation, allocation-key and simulation-key workers now compare their
+  declared consumer config with the stored one at start and update it in place,
+  logging `Updated JetStream consumer <stream>/<durable> in place: …` once per change.
+  A change JetStream refuses stops the worker with `… could not be updated …`, naming
+  the remedy: delete that consumer (`nats consumer rm <stream> <durable>`, from a
+  `natsio/nats-box` container on the `nats` network) and let the worker recreate it.
+  - `worker-billing-docgen` (stream `DOCGEN_RESULTS`) goes from unlimited deliveries
+    to `max_deliver` 6, then the billing DLQ. A result already delivered six times or
+    more is dropped by the broker at the update instead of reaching the DLQ: read
+    `num_redelivered` and `num_ack_pending` in
+    `exec -T nats wget -qO- 'http://127.0.0.1:8222/jsz?consumers=true&config=true'`
+    before recreating billing-worker.
+- **2026-10-19 wave: deploy the allocation-key and simulation-key workers while
+  idle.** Their memory fixes refuse an oversized problem up front (errors 2024
+  `PROBLEM_TOO_LARGE`, 2119 `SIMULATION_TOO_LARGE`) instead of being OOM-killed under
+  the `mem_limit` caps. Under those caps the previous images fail: the old simulation
+  worker re-queues an OOM-killed run every 30 s forever (its durable has no
+  `max_deliver`), and the old allocation-key worker marks large OLAGSA runs FAILED
+  (`algorithm_failed`). Never roll them back while the caps are in place.
+- `GET /simulation/{id}/timeseries` now streams the stored object (capped at 64 MiB,
+  error 2120 `TIMESERIES_TOO_LARGE`), and the SPA asks for a sampled view
+  (`max_points=1500`). KrakenD still decodes JSON responses at about ten times their
+  size, and `krakend` has no `mem_limit` here.
+- crm-backend's BeSt lookups now embed `partOfMunicipalities` (the section decides the
+  GRD in Namur or Baarle-Hertog). Checked against `bosa/opendata-best-webapi:2026-35`,
+  the image this deployment pins: 200, with the section resolved.
+- **Rollback limits of this wave.** crm-backend can go back to the previous image after
+  migration 14 (the new SPA treats the missing `/dso` routes as "lookup unavailable");
+  crm-frontend can, but shows an empty GRD on edited meters; **billing never below the
+  image that knows `CREDITED` once billing migration 3 has run** (the old image accepts
+  a second credit note). The images are floating tags, so a rollback needs the previous
+  image retagged on the host before the pull.
 
 - **A realtime failure is indistinguishable from a quiet system.** The pollers keep
   the UI correct when push is dead, so "nobody complained" is not evidence — three

@@ -74,6 +74,7 @@ them into their final form (`prod-config.json`, `config.json`,
 | nats | JetStream message broker | internal |
 | redis | Realtime (SSE) ticket store and pub/sub bus | internal |
 | best-address | Self-hosted BeSt Address register (FPS BOSA) — the address picker. ~1.7 GB RAM | internal |
+| dso-lookup | Which network operator (GRD) serves an address — prefills the meter form; called by crm-backend only | internal |
 | live-data | Live Data annexe API + ingest worker + scheduler (`live-data` profile) | http://localhost/api/live, device enrolment at /api/live-public/enroll |
 | mosquitto | MQTT broker for the live-data devices — TLS terminates here (`live-data` profile) | mqtts://${LIVE_DATA_BROKER_PUBLIC_HOST}:8883 |
 | reverse-proxy | NGINX reverse proxy | http://localhost |
@@ -109,7 +110,7 @@ Docker Compose profiles control which services start:
 | Profile | Services | Purpose |
 |---------|----------|---------|
 | `init` | swagger-doc-gen, generation-doc-gen, simulation-doc-gen, news-board-doc-gen, billing-doc-gen, administrative-document-doc-gen, live-data-doc-gen, krakend-config, keycloak-config, nginx-config, crm-frontend-config, keycloak-group-id-mapper, keycloak-optimce-theme | One-shot config generators and provider downloads |
-| `backend` | postgres, postgres-init, keycloak-db, keycloak, keycloak-healthcheck, crm-backend, allocation-key-generation (+ worker), simulation-key (+ worker), news-board, billing (+ worker), administrative-document (+ worker), document-generation, notification-dispatch, nats, redis, best-address, minio, minio-init, krakend | Core infrastructure |
+| `backend` | postgres, postgres-init, keycloak-db, keycloak, keycloak-healthcheck, crm-backend, allocation-key-generation (+ worker), simulation-key (+ worker), news-board, billing (+ worker), administrative-document (+ worker), document-generation, notification-dispatch, nats, redis, best-address, dso-lookup, minio, minio-init, krakend | Core infrastructure |
 | `frontend` | reverse-proxy, certbot, crm-frontend | Web serving layer |
 | `live-data` | mosquitto-certs, mosquitto-init, mosquitto, mosquitto-roles, live-data, live-data-worker, live-data-scheduler | The Live Data annexe and its MQTT broker — always combined with `backend` |
 | `migration` | optimce-migrator | One-shot schema migrations, all six databases |
@@ -379,6 +380,75 @@ regime inside the billing image, or `billing` will crash-loop on its startup par
    image's catalogue contains: an unknown name refuses the boot
    (`annexes_services:catalog_overrides` in the log). The set actually served is logged
    once at boot as `annexes_services:catalog_loaded`.
+
+### Internal services are not annexes
+
+`best-address` and `dso-lookup` are **internal**: crm-backend is their only caller, over
+a network of their own, and no gateway route leads to them. None of the five steps above
+applies. An internal service has no doc-gen, no `krakend-builder.yaml` entry, no
+`ANNEX_CATALOG_*` entry (naming one there refuses crm-backend's boot) and no database.
+It is a runtime block in the `backend` profile, a dedicated network shared with
+crm-backend only, and a URL variable on crm-backend whose blank value is the off switch.
+(`dso-lookup` also joins `opentelemetry` for its telemetry, where the annexe services
+can resolve it too; it serves only public, read-only reference data.)
+
+`dso-lookup`'s data (a `belgian-dso-map` release) is baked into its image, so pulling
+`ghcr.io/optimce/dso-lookup:main-prod` is the data refresh. A new release arrives as the
+weekly bump PR in `OptimCE/dso-lookup` and is reviewed there like any code change. The
+GHCR package must be public, since this deployment pulls anonymously, and it must be
+pullable **before** this compose file reaches the host: `./docker-stack.sh start` pulls
+the whole `backend` profile and stops at the first image it cannot pull. Check with an
+anonymous `docker pull ghcr.io/optimce/dso-lookup:main-prod` first.
+
+**First deployment of the GRD prefill.** The release that introduces `dso-lookup` also
+brings CRM migration 014 (`meter_data.grd_source`, `grd_data_version`, and the rewrite of
+the legacy `grd` display names to the stable ids, "ORES" → `ores`). The new crm-backend
+needs it **before** it starts: TypeORM selects every entity column, so on the old schema
+every meter read answers 500. `./docker-stack.sh start` and `restart` never migrate, and
+`migrate` takes no backup, so deploy with a full stop, in this order, from the repository
+root:
+
+1. Pull everything while the old stack still runs. An image that cannot be pulled then
+   stops the deploy before anything has changed:
+
+   ```bash
+   DC="docker compose -f docker-compose/docker-compose.yml --env-file docker-compose/.env"
+   P="--profile init --profile backend --profile frontend"
+   $DC $P pull
+   ./docker-stack.sh migrate --dry-run   # pulls the migrator; lists every "would apply"
+   ```
+
+2. `./docker-stack.sh stop` backs up every database, then takes the stack down. A failed
+   backup job is only reported, so check that the newest `crm_db_*` and `billing_*`
+   dumps exist and are not empty before going on.
+3. `./docker-stack.sh migrate --no-pull`, then `./docker-stack.sh verify`. With the stack
+   down nothing holds a lock on `meter_data`, and no old service image runs against a
+   migrated table (billing's migration 3, if still pending, must not run while an older
+   billing image serves). 014's rewrite is not undone by any rollback; its header holds
+   a read-only report query to run before and after. Its first run also bumps
+   `meter_data.updated_at` on every rewritten row.
+4. `./docker-stack.sh start --no-pull --wait-init 60`. `--no-pull` keeps the images
+   pulled in step 1; the longer wait lets the `init` profile finish regenerating the
+   gateway configuration before KrakenD starts.
+5. Check the gateway. The `/dso/*` routes reach KrakenD through crm-backend's swagger on
+   GitHub Pages (published by its `update-documentation.yml` after the merge), so
+   `krakend.json` must now contain them; KrakenD reads it only at start:
+
+   ```bash
+   grep -c '"endpoint": "/dso/' docker-compose/krakend_config/krakend.json   # 2
+   # 0: Pages still served the old swagger. Regenerate (re-runs the doc-gens), grep again:
+   $DC $P run --rm -T krakend-config
+   $DC $P exec -T krakend krakend check -t -c /etc/krakend/krakend.json
+   $DC $P restart krakend
+   $DC $P exec -T reverse-proxy nginx -s reload
+   ```
+
+   Until then the gateway answers 404 on `/dso/*` and the meter form treats it as
+   "lookup unavailable": nothing breaks, the GRD is simply not prefilled.
+
+To switch the prefill off without a redeploy, blank `DSO_LOOKUP_URL=` in `.env`, run
+`$DC $P up -d --no-deps crm-backend`, then reload nginx (it resolves crm-backend once, at
+start).
 
 ## Contributing
 

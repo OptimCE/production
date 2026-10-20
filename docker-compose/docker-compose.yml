@@ -496,6 +496,57 @@ services:
       retries: 5
       start_period: 120s
 
+  # The internal GRD lookup: which network operator (GRD/DSO) serves a Belgian
+  # address, used by crm-backend to prefill the GRD of a new meter.
+  #
+  # INTERNAL, NOT AN ANNEX. crm-backend is its only caller, over the dedicated
+  # `dso-lookup` network. It is not on `api-gateway`, so KrakenD cannot route to
+  # it, and it has no *-doc-gen, no krakend-builder.yaml entry and no place in
+  # krakend's depends_on: the gateway only exposes crm-backend's own /dso/*
+  # routes, which travel in crm-backend's swagger. NEVER name it in
+  # ANNEX_CATALOG_ENABLE/DISABLE - a name the catalogue does not contain refuses
+  # crm-backend's boot.
+  #
+  # The data (a belgian-dso-map release) is baked into the image, so pulling
+  # :main-prod IS the data refresh. A new release arrives as the weekly bump PR
+  # in OptimCE/dso-lookup and is reviewed there like any code change. The GHCR
+  # package must be public: this deployment pulls anonymously, and
+  # docker-stack.sh start stops at the first backend image it cannot pull.
+  #
+  # ENV=production refuses to boot without LOGGING_TOKEN, LOGGING_LOGS_URL and
+  # LOGGING_METRICS_URL (LOGGING_TRACES_URL is passed but not required). It joins
+  # `opentelemetry` like every service that exports telemetry - see the
+  # `dso-lookup` network comment for what that membership costs. Nothing waits
+  # on it: POST /meters never calls it, and with the service down
+  # GET /dso/resolve answers `status: unavailable` and the meter form keeps its
+  # plain GRD select.
+  #
+  # No published port. The development stack binds 127.0.0.1:8097 for its curl
+  # checks; here the equivalent is `docker compose exec`.
+  dso-lookup:
+    profiles: ["backend"]
+    image: ghcr.io/optimce/dso-lookup:main-prod
+    restart: unless-stopped
+    environment:
+      - ENV=production
+      - LOGGING_TOKEN=${LOGGING_TOKEN}
+      - LOGGING_TRACES_URL=${LOGGING_TRACES_URL}
+      - LOGGING_LOGS_URL=${LOGGING_LOGS_URL}
+      - LOGGING_METRICS_URL=${LOGGING_METRICS_URL}
+    networks:
+      - dso-lookup
+      - opentelemetry
+    healthcheck:
+      # Readiness is red until the baked-in data has loaded and checked out; a
+      # bad data directory fails the boot outright rather than serving nothing.
+      test:
+        - "CMD-SHELL"
+        - "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health/readiness', timeout=3).status==200 else 1)\""
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
   keycloak:
     profiles: ["backend"]
     image: quay.io/keycloak/keycloak:26.5.5@sha256:a7b0cb7a43a1235a61872883414d3f1d9a3ceac9df6e5907bd12202778a6265c
@@ -751,6 +802,19 @@ services:
       # suggestions" on its own - is the wrong trade.
       - BEST_ADDRESS_URL=${BEST_ADDRESS_URL-http://best-address:8080/belgianAddress/v2}
       - BEST_ADDRESS_TIMEOUT_MS=${BEST_ADDRESS_TIMEOUT_MS:-1500}
+      # ---- The internal GRD lookup (meter form prefill) ------------------
+      # The `-` form, NOT `:-`, for the same reason as BEST_ADDRESS_URL: a
+      # deliberately BLANK value is the off switch. With no URL the client is
+      # unbound, GET /dso/resolve answers `status: unavailable` rather than
+      # erroring, and the meter form keeps its plain GRD select. Deleting the
+      # line does NOT turn it off.
+      #
+      # There is deliberately no `depends_on: dso-lookup`. POST /meters never
+      # calls it, so gating the CRM API on it would protect a prefill at the
+      # cost of the whole API. 1000 ms because one resolve makes at most two
+      # sequential calls, and both must fit KrakenD's 3000 ms global timeout.
+      - DSO_LOOKUP_URL=${DSO_LOOKUP_URL-http://dso-lookup:8000}
+      - DSO_LOOKUP_TIMEOUT_MS=${DSO_LOOKUP_TIMEOUT_MS:-1000}
     volumes:
       - ./reference:/app/reference:ro
     networks:
@@ -764,6 +828,9 @@ services:
       # crm-backend is the ONLY member of this network - see the `best-address`
       # comment at the bottom of this file.
       - best-address
+      # crm-backend is the ONLY other member of this network - see the
+      # `dso-lookup` comment at the bottom of this file.
+      - dso-lookup
       # For `location = ${WEB_REALTIME_PATH}` only - see the `sse` network
       # comment at the bottom of this file.
       - sse
@@ -2006,6 +2073,18 @@ networks:
   # Naming a network rather than reusing `crm` - which ten services already share
   # - keeps that grant an opt-in that shows up in review.
   best-address:
+  # The internal GRD lookup. crm-backend is its only other member: the one
+  # service meant to call dso-lookup, which has no authentication of its own and
+  # sits behind no gateway. Naming a network rather than reusing `crm` - which
+  # ten services already share - keeps that grant an opt-in that shows up in
+  # review.
+  #
+  # Unlike best-address, this is not a hard boundary: dso-lookup also joins
+  # `opentelemetry` for its telemetry exports, and the annexe services on that
+  # network can resolve it too. Tolerated because all it serves is public,
+  # read-only reference data (the dataset ships in a public image) and it logs
+  # no query parameter.
+  dso-lookup:
   # reverse-proxy <-> crm-backend, for `location = ${WEB_REALTIME_PATH}` - the one
   # path that bypasses the API gateway.
   #
