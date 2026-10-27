@@ -141,6 +141,24 @@ and this project adheres to
 - README: "Internal services are not annexes", the service table and profile list,
   and the first-deployment order (pull, stop, migrate 14, start, gateway check).
 
+### Added (in-app tours and onboarding offers)
+
+- **crm-frontend ships the Steppy in-app tours** (Help dialog, "First steps") and
+  **offers them at key moments**: a welcome dialog on a first login with no community,
+  then a role banner the first time a user is member, manager or admin of a community.
+  The tours are static files under the SPA's `/tours/`, served by `crm-frontend` like
+  any other asset: no new service, no nginx change.
+- **crm-backend `GET /me/onboarding` and `PUT /me/onboarding/{tour_key}`** record each
+  answer (dismissed, started, completed, abandoned). They reach KrakenD through
+  crm-backend's swagger, so the gateway must be regenerated (`krakend-config`, then a
+  `krakend` restart) once crm-backend's docs are published.
+- **Off switch:** `"onboarding": { "enabled": false }` in
+  `crm-frontend-config/config.json` stops the offers; the tours stay in the Help
+  dialog. Absent means enabled, so `config.template.json` is unchanged.
+- No new environment variable, image, profile or grant: `user_onboarding` is created
+  by `crm_svc` (through the migrator) and only crm-backend writes it; the annexes get
+  `SELECT` from the default privileges like every other CRM table.
+
 ### Added (migrations)
 
 - **CRM migration 11 — house numbers become text, plus the BeSt link.**
@@ -214,10 +232,21 @@ and this project adheres to
   - Online-safe (two catalogue-only `ADD COLUMN`s, an UPDATE of the changed rows only,
     5-second `lock_timeout`). Its header holds a read-only report of the values that
     are not ids yet: run it before and after.
+- **CRM migration 15 — `user_onboarding`.** One row per (user, tour) answered; no row
+  means never offered. **Existing users are backfilled** as `backfilled` for `welcome`
+  and for every role tour they already qualify for, so nobody already using the
+  platform gets the welcome dialog on their next login. The backfill runs only when
+  the migration creates the table, so a replay never marks later sign-ups.
+  - **Apply it before the new crm-backend image.** The new image reads and writes the
+    table (`/me/onboarding` answers 500 without it); the previous image never names it
+    and keeps working on the migrated database.
+  - Online-safe: one `CREATE TABLE` and four `INSERT … SELECT`s over `app_user`,
+    `community_user` and `user_member_link`.
 - `docker-compose/schemas/crm_db.sql` re-vendored from the monorepo, carrying the
   same address block and, since migration 12, `chk_meter_ean_18_digits` on `meter`.
   Since migration 13 it also creates `municipality_postal_code.created_at`.
   Since migration 14 it also creates `meter_data.grd_source` and `grd_data_version`.
+  Since migration 15 it also creates `user_onboarding`.
   **Inert for the running deployment** — `postgres-init` applies
   a baseline only to a database with no relations — but it is what stops a
   rebuild-from-empty landing one migration short, permanently and with no way to
