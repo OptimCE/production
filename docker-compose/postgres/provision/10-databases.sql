@@ -1,5 +1,5 @@
 -- ===========================================================================
--- Seven logical databases in one instance — NOT one database with seven schemas.
+-- Eight logical databases in one instance — NOT one database with eight schemas.
 --
 -- Every annexe service documents "cross-DB references are plain columns, never
 -- foreign keys". Separate databases are what currently enforce that by physics.
@@ -34,7 +34,9 @@ SELECT format('CREATE DATABASE %I OWNER %I', d.name, d.owner)
     ('news_board_local',              'news_board_svc'),
     ('billing_local',                 'billing_svc'),
     ('administrative_document_local', 'administrative_document_svc'),
-    ('live_data_local',               'live_data_svc')
+    ('live_data_local',               'live_data_svc'),
+    -- Created whether or not the signature profile runs, like live_data_local.
+    ('signature_local',               'signature_svc')
   ) AS d(name, owner)
  WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = d.name)
 \gexec
@@ -49,10 +51,11 @@ REVOKE CONNECT ON DATABASE
     news_board_local,
     billing_local,
     administrative_document_local,
-    live_data_local
+    live_data_local,
+    signature_local
   FROM PUBLIC;
 
--- template1 too, so a seventh database created here later inherits "PUBLIC
+-- template1 too, so a ninth database created here later inherits "PUBLIC
 -- cannot connect" instead of relying on someone remembering this file.
 --
 -- `postgres` (the maintenance database) is deliberately NOT revoked: pg_database
@@ -67,6 +70,7 @@ GRANT CONNECT ON DATABASE news_board_local              TO news_board_svc;
 GRANT CONNECT ON DATABASE billing_local                 TO billing_svc;
 GRANT CONNECT ON DATABASE administrative_document_local TO administrative_document_svc;
 GRANT CONNECT ON DATABASE live_data_local                TO live_data_svc;
+GRANT CONNECT ON DATABASE signature_local               TO signature_svc;
 
 -- crm_db: its owner, plus every consumer of the read-only CRM port — including
 -- notification_dispatch_svc, whose ONLY database this is. What each of them may
@@ -79,4 +83,5 @@ GRANT CONNECT ON DATABASE crm_db TO
     billing_svc,
     administrative_document_svc,
     notification_dispatch_svc,
-    live_data_svc;
+    live_data_svc,
+    signature_svc;

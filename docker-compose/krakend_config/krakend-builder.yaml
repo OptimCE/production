@@ -1,4 +1,16 @@
 global:
+  # /app/extra-config.json is the copy BAKED INTO the swagger2krakend image, not
+  # this repo's krakend_config/extra-config.json (mounted at /config/, read by
+  # nothing): the image's copy is what decides propagate_claims. The repo copy
+  # mirrors it so a review of this repo shows what the gateway forwards.
+  #
+  # The signature annexe needs a swagger2krakend image built from 66c0ddf
+  # (2026-11-03) or later. That commit adds auth_time / sid / acr to the
+  # baked propagate_claims (as x-auth-time / x-auth-sid / x-auth-acr) AND lets
+  # them, x-source-ip and User-Agent through input_headers. With an older image
+  # the headers are stripped and every sign call is refused for want of a
+  # recent login - with nothing else visibly wrong. Check the generated
+  # krakend.json (`grep -c x-auth-time krakend_config/krakend.json`), not this.
   extra_config: /app/extra-config.json
   # Every other endpoint keeps the generator's 3000ms. The upload and
   # file-download endpoints (multipart bodies, non-JSON responses: consumption
@@ -33,6 +45,16 @@ services:
   administrative-document:
     swagger: /config/administrative-document.json
     host: administrative-document:8000
+  # The signature annexe (/signature/*). Its swagger is written by
+  # signature-doc-gen, which is in the `init` profile so this entry never points
+  # at a missing file: an empty spec (zero routes) while SIGNATURE_ENABLED is not
+  # true, the published one once it is. Like live-data, the host need not
+  # resolve when the signature profile is not running: KrakenD resolves it per
+  # request, so only these routes fail until it does. The sign call needs the
+  # x-auth-time header described at the top of this file.
+  signature:
+    swagger: /config/signature.json
+    host: signature:8000
 
   # ---- live-data: ONE service, TWO entries ----------------------------------
   #

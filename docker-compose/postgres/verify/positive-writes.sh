@@ -42,6 +42,7 @@ pw_for() {
         administrative_document_svc) printf '%s' "$ADMINISTRATIVE_DOCUMENT_DB_PASSWORD" ;;
         notification_dispatch_svc)   printf '%s' "$NOTIFICATION_DISPATCH_DB_PASSWORD" ;;
         live_data_svc)               printf '%s' "${LIVE_DATA_DB_PASSWORD:-}" ;;
+        signature_svc)               printf '%s' "${SIGNATURE_DB_PASSWORD:-}" ;;
         *) printf '' ;;
     esac
 }
@@ -54,6 +55,21 @@ check() {
     pw=$(pw_for "$role")
     if out=$(PGPASSWORD="$pw" psql --no-psqlrc -q -v ON_ERROR_STOP=1 \
         -U "$role" -d crm_db -f - 2>&1); then
+        PASSED=$((PASSED + 1))
+        printf '  ok    %s\n' "$label"
+    else
+        FAILED=$((FAILED + 1))
+        printf '  FAIL  %s\n' "$label"
+        printf '%s\n' "$out" | sed 's/^/          /'
+    fi
+}
+
+# check_as <role> <label> — SQL on stdin, run by the SUPERUSER (the PG* of the
+# postgres-init container) so it can stage what the role cannot write itself,
+# then `SET LOCAL ROLE <role>` for the write under test. Must succeed.
+check_as() {
+    role=$1; label=$2
+    if out=$(psql --no-psqlrc -q -v ON_ERROR_STOP=1 -d crm_db -f - 2>&1); then
         PASSED=$((PASSED + 1))
         printf '  ok    %s\n' "$label"
     else
@@ -85,9 +101,17 @@ absent() {
 AUDIT_WRITERS='allocation_key_svc simulation_key_svc news_board_svc billing_svc administrative_document_svc live_data_svc'
 NOTIFIERS='news_board_svc billing_svc administrative_document_svc'
 
+# signature_svc is a notifier too (invitations, reminders, completions), but it
+# is proved only once SIGNATURE_DB_PASSWORD is in .env: the signature profile
+# ships OFF, and a role without a password cannot log in at all.
+if [ -n "${SIGNATURE_DB_PASSWORD:-}" ]; then
+    NOTIFIERS="$NOTIFIERS signature_svc"
+fi
+
 # ---------------------------------------------------------------------------
 echo
 echo 'audit_log INSERT + audit_log_id_seq USAGE — all six annexe roles'
+echo '  (signature_svc is not one: its evidence log lives in signature_local.)'
 echo '  (id_community is nullable, so this ALWAYS inserts exactly one row and'
 echo '   therefore ALWAYS calls nextval — the sequence grant is really exercised,'
 echo '   not skipped because a lookup happened to return nothing.)'
@@ -209,6 +233,139 @@ ROLLBACK;
 SQL
 else
     skip 'bounce record — public.email_suppression not in this schema'
+fi
+
+# ---------------------------------------------------------------------------
+# regulatory_link_status arrives with crm schema v17 (optimce-migrator), so it is
+# guarded like the notification tables above: the grant and these assertions
+# light up together on the first postgres-init after the migrator.
+echo
+echo 'regulatory_link_status — administrative_document_svc opens an episode and'
+echo '  moves its effect columns, with the upsert its effects port issues.'
+echo '  (Needs one sharing operation; GENERATED ALWAYS AS IDENTITY, so no sequence'
+echo '   grant is involved. Rolled back: nothing is left behind.)'
+if crm_table_exists regulatory_link_status; then
+    check administrative_document_svc 'administrative_document_svc -> regulatory_link_status' <<'SQL'
+BEGIN;
+WITH op AS (SELECT id, id_community FROM sharing_operation ORDER BY id LIMIT 1)
+INSERT INTO regulatory_link_status
+    (id_community, id_sharing_operation, subject_type, subject_ref, id_dossier_origin, regulatory_status, valid_from)
+SELECT id_community, id, 1, '000000000000000000', -1, 2, current_date FROM op
+ON CONFLICT (id_dossier_origin, subject_type, subject_ref)
+DO UPDATE SET regulatory_status = EXCLUDED.regulatory_status, valid_from = EXCLUDED.valid_from,
+              valid_to = EXCLUDED.valid_to, regulatory_ref = EXCLUDED.regulatory_ref;
+UPDATE regulatory_link_status SET regulatory_status = 5, valid_to = NULL, regulatory_ref = 'OPT--1'
+ WHERE id_dossier_origin = -1;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM regulatory_link_status WHERE id_dossier_origin = -1 AND regulatory_status = 5) THEN
+    RAISE EXCEPTION 'nothing was inserted: crm_db has no sharing_operation row, so this grant was never exercised';
+  END IF;
+END $$;
+ROLLBACK;
+SQL
+
+    echo '  ... and withdraws one (status 9): a change cancelled before it was'
+    echo '  authorised; the annexe has no DELETE, so the row stays.'
+    check administrative_document_svc 'administrative_document_svc -> regulatory_link_status (withdrawn)' <<'SQL'
+BEGIN;
+WITH op AS (SELECT id, id_community FROM sharing_operation ORDER BY id LIMIT 1)
+INSERT INTO regulatory_link_status
+    (id_community, id_sharing_operation, subject_type, subject_ref, id_dossier_origin, regulatory_status)
+SELECT id_community, id, 1, '000000000000000000', -1, 1 FROM op;
+UPDATE regulatory_link_status SET regulatory_status = 9 WHERE id_dossier_origin = -1;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM regulatory_link_status WHERE id_dossier_origin = -1 AND regulatory_status = 9) THEN
+    RAISE EXCEPTION 'nothing was inserted: crm_db has no sharing_operation row, so this grant was never exercised';
+  END IF;
+END $$;
+ROLLBACK;
+SQL
+
+    # The alignment needs a meter in an operation with no open episode yet. On a
+    # live database every meter may already have one; that is a data reason,
+    # not a grant reason, so it is a skip rather than a failure.
+    candidates=$(psql --no-psqlrc -tAq -d crm_db -c "
+        SELECT count(*) FROM meter_data md
+         WHERE md.id_sharing_operation IS NOT NULL AND md.end_date IS NULL
+           AND NOT EXISTS (SELECT 1 FROM regulatory_link_status r
+                            WHERE r.subject_type = 1 AND r.subject_ref = md.ean
+                              AND r.regulatory_status BETWEEN 2 AND 5)" 2>/dev/null || echo 0)
+    echo '  ... and its ACTIVE write turns the meter waiting in the CRM active from'
+    echo '  that date: the core trigger is SECURITY DEFINER, so the role, which'
+    echo '  cannot write meter_data, still lands it. (The superuser makes one meter'
+    echo '  waiting first, inside the transaction; rolled back.)'
+    if [ "${candidates:-0}" -gt 0 ] 2>/dev/null; then
+        check_as administrative_document_svc 'administrative_document_svc -> ACTIVE aligns meter_data' <<'SQL'
+BEGIN;
+CREATE TEMP TABLE picked ON COMMIT DROP AS
+SELECT md.id, md.ean, md.id_sharing_operation, md.id_community
+  FROM meter_data md
+ WHERE md.id_sharing_operation IS NOT NULL AND md.end_date IS NULL
+   AND NOT EXISTS (SELECT 1 FROM regulatory_link_status r
+                    WHERE r.subject_type = 1 AND r.subject_ref = md.ean
+                      AND r.regulatory_status BETWEEN 2 AND 5)
+ ORDER BY md.id LIMIT 1;
+SELECT 1 / count(*)::int FROM picked;
+UPDATE meter_data SET status = 3, start_date = LEAST(start_date, current_date - 1)
+ WHERE id = (SELECT id FROM picked);
+GRANT SELECT ON picked TO administrative_document_svc;
+SET LOCAL ROLE administrative_document_svc;
+INSERT INTO regulatory_link_status
+    (id_community, id_sharing_operation, subject_type, subject_ref, id_dossier_origin, regulatory_status, valid_from)
+SELECT id_community, id_sharing_operation, 1, ean, -1, 5, current_date FROM picked;
+RESET ROLE;
+SELECT 1 / count(*)::int FROM meter_data
+ WHERE ean = (SELECT ean FROM picked) AND status = 1 AND start_date = current_date;
+SELECT 1 / count(*)::int FROM meter_data
+ WHERE id = (SELECT id FROM picked) AND status = 3 AND end_date = current_date - 1;
+ROLLBACK;
+SQL
+    else
+        skip 'ACTIVE alignment — no meter in an operation without an open episode'
+    fi
+else
+    skip 'regulatory_link_status — not in this schema (crm < v17)'
+fi
+
+# ---------------------------------------------------------------------------
+# signature_local is not a CRM write, but it is the one local database whose
+# owner must NOT be able to do everything: the evidence log is append-only, and
+# the guard is a trigger, not a grant. Proved here because a schema change that
+# drops the trigger would otherwise go unnoticed until a dispute.
+echo
+echo 'signature_local — signature_svc writes its own evidence log, and the'
+echo '  append-only guard refuses an UPDATE of it, even to its owner.'
+if [ -z "${SIGNATURE_DB_PASSWORD:-}" ]; then
+    skip 'signature_local — SIGNATURE_DB_PASSWORD is not set (signature profile off)'
+elif out=$(PGPASSWORD="$(pw_for signature_svc)" psql --no-psqlrc -q -v ON_ERROR_STOP=1 \
+    -U signature_svc -d signature_local -f - 2>&1 <<'SQL'
+BEGIN;
+INSERT INTO signature_request
+    (id, id_community, source_service, source_ref, idempotency_key, title, locale,
+     original_key, original_sha256, signing_order, status, consent_version, expires_at)
+VALUES ('00000000-0000-0000-0000-00000000f00d', -1, 'verify', 'verify',
+        'verify-' || gen_random_uuid(), 'verify', 'fr', 'verify', repeat('0', 64), 1, 1, 'v1',
+        now() + interval '1 day');
+INSERT INTO signature_event (request_id, seq, type, at, prev_hash, hash)
+VALUES ('00000000-0000-0000-0000-00000000f00d', 1, 'request.created', now(),
+        repeat('0', 64), repeat('1', 64));
+DO $$
+BEGIN
+    UPDATE signature_event SET ip = 'verify'
+     WHERE request_id = '00000000-0000-0000-0000-00000000f00d';
+    RAISE EXCEPTION 'signature_event accepted an UPDATE';
+EXCEPTION WHEN integrity_constraint_violation THEN
+    NULL;
+END $$;
+ROLLBACK;
+SQL
+); then
+    PASSED=$((PASSED + 1))
+    printf '  ok    signature_svc -> signature_event (insert; update refused)\n'
+else
+    FAILED=$((FAILED + 1))
+    printf '  FAIL  signature_svc -> signature_event\n'
+    printf '%s\n' "$out" | sed 's/^/          /'
 fi
 
 # ---------------------------------------------------------------------------

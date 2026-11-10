@@ -73,6 +73,7 @@ pw_for() {
         administrative_document_svc) printf '%s' "$ADMINISTRATIVE_DOCUMENT_DB_PASSWORD" ;;
         notification_dispatch_svc)   printf '%s' "$NOTIFICATION_DISPATCH_DB_PASSWORD" ;;
         live_data_svc)               printf '%s' "${LIVE_DATA_DB_PASSWORD:-}" ;;
+        signature_svc)               printf '%s' "${SIGNATURE_DB_PASSWORD:-}" ;;
         *) printf '' ;;
     esac
 }
@@ -87,7 +88,7 @@ administrative_document_svc|administrative_document_local
 live_data_svc|live_data_local
 notification_dispatch_svc|-'
 
-LOCAL_DBS='allocation_key_local simulation_key_local news_board_local billing_local administrative_document_local live_data_local'
+LOCAL_DBS='allocation_key_local simulation_key_local news_board_local billing_local administrative_document_local live_data_local signature_local'
 
 # Every role that reaches crm_db without owning it.
 CRM_CONSUMERS='allocation_key_svc simulation_key_svc news_board_svc billing_svc administrative_document_svc live_data_svc notification_dispatch_svc'
@@ -96,7 +97,26 @@ CRM_CONSUMERS='allocation_key_svc simulation_key_svc news_board_svc billing_svc 
 # them — it owns the delivery loop and nothing else.
 ANNEXES='allocation_key_svc simulation_key_svc news_board_svc billing_svc administrative_document_svc live_data_svc'
 
+# signature_svc joins the matrices only once SIGNATURE_DB_PASSWORD is in .env.
+# The signature profile ships OFF, and without a password the role exists but
+# cannot log in (see 00-roles.sql): every "must succeed" row would fail for a
+# configuration reason, and every "must fail" row would pass for the wrong one.
+# signature_local stays in LOCAL_DBS either way: no OTHER role may reach it.
+if [ -n "${SIGNATURE_DB_PASSWORD:-}" ]; then
+    SIGNATURE_ROLE=signature_svc
+    OWNERS="$OWNERS
+signature_svc|signature_local"
+    CRM_CONSUMERS="$CRM_CONSUMERS signature_svc"
+else
+    SIGNATURE_ROLE=
+fi
+
 # ---------------------------------------------------------------------------
+if [ -z "$SIGNATURE_ROLE" ]; then
+    echo
+    skip 'signature_svc rows — SIGNATURE_DB_PASSWORD is not set (signature profile off)'
+fi
+
 echo
 echo 'A. Cross-database reachability — must FAIL'
 echo '   REVOKE CONNECT ... FROM PUBLIC in 10-databases.sql is the line under test.'
@@ -159,18 +179,21 @@ done
 
 echo
 echo '   ... and each narrow grant absent from every role that must not have it'
-for role in simulation_key_svc news_board_svc billing_svc administrative_document_svc live_data_svc notification_dispatch_svc; do
+for role in simulation_key_svc news_board_svc billing_svc administrative_document_svc live_data_svc notification_dispatch_svc $SIGNATURE_ROLE; do
     pw=$(pw_for "$role")
     run fail "$role" "$pw" crm_db \
         "INSERT INTO allocation_key (name, description, id_community) VALUES ('_verify', '_verify', 1)" \
         "$role INSERT allocation_key"
 done
 
-# notification_dispatch_svc writes no audit trail — it is the one crm_db consumer
-# without that grant, and the asymmetry is easy to erase by accident.
-run fail notification_dispatch_svc "$(pw_for notification_dispatch_svc)" crm_db \
-    "INSERT INTO audit_log (action, source, entity_type) VALUES ('_verify', '_verify', '_verify')" \
-    'notification_dispatch_svc INSERT audit_log'
+# notification_dispatch_svc writes no audit trail, and neither does signature_svc
+# (its evidence log lives in signature_local): the two crm_db consumers without
+# that grant, and the asymmetry is easy to erase by accident.
+for role in notification_dispatch_svc $SIGNATURE_ROLE; do
+    run fail "$role" "$(pw_for "$role")" crm_db \
+        "INSERT INTO audit_log (action, source, entity_type) VALUES ('_verify', '_verify', '_verify')" \
+        "$role INSERT audit_log"
+done
 
 # Guarded: these tables are not on this production line's CRM schema yet. The
 # grants in 30-crm-grants.sql are guarded the same way, so the two converge
@@ -193,7 +216,7 @@ if crm_table_exists outbound_message; then
     # UPDATE is notification_dispatch_svc's alone: it is what makes the
     # SELECT ... FOR UPDATE SKIP LOCKED claim loop possible, and no annexe may
     # have it or the producer/dispatcher boundary collapses.
-    for role in $ANNEXES; do
+    for role in $ANNEXES $SIGNATURE_ROLE; do
         pw=$(pw_for "$role")
         run fail "$role" "$pw" crm_db \
             'UPDATE outbound_message SET status = status WHERE id = -1' \
@@ -209,7 +232,7 @@ fi
 
 if crm_table_exists email_suppression; then
     # The bounce record belongs to the dispatcher only.
-    for role in $ANNEXES; do
+    for role in $ANNEXES $SIGNATURE_ROLE; do
         pw=$(pw_for "$role")
         run fail "$role" "$pw" crm_db \
             "INSERT INTO email_suppression (email, reason) VALUES ('_verify@example.invalid', 4)" \
@@ -217,6 +240,42 @@ if crm_table_exists email_suppression; then
     done
 else
     skip 'email_suppression negatives — public.email_suppression not in this schema'
+fi
+
+# regulatory_link_status arrives with crm schema v17 (optimce-migrator). Only
+# the administrative annexe writes it, and only the four effect columns: the
+# identity of an episode is immutable, nothing is deleted, and the meter_data
+# alignment happens in a SECURITY DEFINER trigger, never through a grant.
+if crm_table_exists regulatory_link_status; then
+    echo
+    echo '   ... regulatory_link_status: administrative_document_svc only, and only'
+    echo '   its four effect columns'
+    for role in allocation_key_svc simulation_key_svc news_board_svc billing_svc live_data_svc notification_dispatch_svc $SIGNATURE_ROLE; do
+        pw=$(pw_for "$role")
+        # Asked of the catalogue, not attempted: an INSERT of a dummy row would
+        # also fail on its foreign keys and prove nothing about the grant.
+        # Division by zero when the privilege is absent = the expected failure.
+        run fail "$role" "$pw" crm_db \
+            "SELECT 1 / has_table_privilege('regulatory_link_status', 'INSERT')::int" \
+            "$role INSERT regulatory_link_status"
+        run fail "$role" "$pw" crm_db \
+            'UPDATE regulatory_link_status SET regulatory_status = regulatory_status WHERE id = -1' \
+            "$role UPDATE regulatory_link_status.regulatory_status"
+    done
+    ad_pw=$(pw_for administrative_document_svc)
+    for column in id_community id_sharing_operation subject_type subject_ref id_dossier_origin created_at; do
+        run fail administrative_document_svc "$ad_pw" crm_db \
+            "UPDATE regulatory_link_status SET $column = $column WHERE id = -1" \
+            "administrative_document_svc UPDATE regulatory_link_status.$column"
+    done
+    run fail administrative_document_svc "$ad_pw" crm_db \
+        'DELETE FROM regulatory_link_status WHERE id = -1' \
+        'administrative_document_svc DELETE regulatory_link_status'
+    run fail administrative_document_svc "$ad_pw" crm_db \
+        'UPDATE meter_data SET status = status WHERE id = -1' \
+        'administrative_document_svc UPDATE meter_data'
+else
+    skip 'regulatory_link_status negatives — not in this schema (crm < v17)'
 fi
 
 # ---------------------------------------------------------------------------

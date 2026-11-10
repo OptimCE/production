@@ -18,7 +18,7 @@
 
 -- ALTER ROLE ... PASSWORD is echoed verbatim into the server log when
 -- log_statement is 'ddl' or 'all'. The default is 'none', but pin it for this
--- session so a server configured to log DDL does not persist eight cleartext
+-- session so a server configured to log DDL does not persist nine cleartext
 -- passwords. (password_encryption defaults to scram-sha-256, so nothing is
 -- cleartext at rest.)
 SET log_statement = 'none';
@@ -46,7 +46,10 @@ BEGIN
     -- live-data (API, ingest worker and scheduler share it). Created whether or
     -- not the live-data profile runs, so the isolation matrix is the same
     -- everywhere.
-    'live_data_svc'
+    'live_data_svc',
+    -- The signature annexe (API and seal worker share it). Created whether or
+    -- not the signature profile runs, for the same reason as live_data_svc.
+    'signature_svc'
   ] LOOP
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = r) THEN
       EXECUTE format(
@@ -74,3 +77,6 @@ ALTER ROLE notification_dispatch_svc   WITH LOGIN PASSWORD :'notification_dispat
 -- half-configured live-data from failing postgres-init — and with it every
 -- service in the stack.
 ALTER ROLE live_data_svc               WITH LOGIN PASSWORD :'live_data_password';
+-- Same tolerance for an empty signature_password: the signature profile ships
+-- OFF, and a .env without SIGNATURE_DB_PASSWORD must not fail postgres-init.
+ALTER ROLE signature_svc               WITH LOGIN PASSWORD :'signature_password';

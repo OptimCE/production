@@ -214,9 +214,10 @@ exit /b 0
 :stop_stack
 echo Running backups before stopping...
 call :do_backup
-rem live-data included: left out, its containers keep running and `down` fails to
-rem remove the networks they are attached to.
-%DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --profile init --profile backend --profile frontend --profile live-data down
+rem live-data and signature included: left out, their containers keep running and
+rem `down` fails to remove the networks they are attached to. (signature is never
+rem started by this script; it may have been started by hand.)
+%DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --profile init --profile backend --profile frontend --profile live-data --profile signature down
 exit /b %errorlevel%
 
 :do_backup

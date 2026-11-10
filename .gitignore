@@ -9,6 +9,9 @@ docker-compose/krakend_config/billing.json
 docker-compose/krakend_config/administrative-document.json
 docker-compose/krakend_config/live.json
 docker-compose/krakend_config/live-public.json
+# Written by signature-doc-gen: the published spec, or an empty one while
+# SIGNATURE_ENABLED is not true.
+docker-compose/krakend_config/signature.json
 
 # Generated, never a source file. The `init` profile writes the gateway's root
 # spec as `root.yaml` above; `swagger.yaml` is the older name for the same output
@@ -24,4 +27,9 @@ docker-compose/nginx/conf.d/default.conf
 docker-compose/keycloak/providers/
 
 docker-compose/backups/
+
+# The signature annexe's seal: the platform's PKCS#12 (certificate AND private
+# key) and its trust roots, mounted into signature-worker only. A secret: it
+# must never reach this repository.
+docker-compose/signature-seal/
 .env

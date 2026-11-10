@@ -1,6 +1,6 @@
 # The unified Postgres instance
 
-One PostgreSQL instance (compose service `postgres`) holds seven logical databases,
+One PostgreSQL instance (compose service `postgres`) holds eight logical databases,
 each owned by its own login role. `keycloak-db` remains a separate instance — see
 [Why Keycloak is not here](#why-keycloak-is-not-here).
 
@@ -13,6 +13,7 @@ each owned by its own login role. `keycloak-db` remains a separate instance — 
 | `billing_local` | `billing_svc` | billing (+ worker) | `BILLING_DB_PASSWORD` |
 | `administrative_document_local` | `administrative_document_svc` | administrative-document (+ worker) | `ADMINISTRATIVE_DOCUMENT_DB_PASSWORD` |
 | `live_data_local` | `live_data_svc` | live-data (+ worker, scheduler) | `LIVE_DATA_DB_PASSWORD` |
+| `signature_local` | `signature_svc` | signature (+ seal worker) | `SIGNATURE_DB_PASSWORD` |
 
 `live_data_local` is provisioned whether or not the `live-data` profile runs, so the
 isolation matrix is the same everywhere. An empty `LIVE_DATA_DB_PASSWORD` does not fail
@@ -21,7 +22,12 @@ password", and the role simply cannot log in — a half-configured live-data nev
 costs the platform. Its baseline embodies `schema_version` 4; `optimce-migrator` does
 not manage this database yet, so its first schema change needs a migrator entry.
 
-Plus an **eighth role that owns no database**: `notification_dispatch_svc`
+`signature_local` follows the same rules: provisioned whether or not the `signature`
+profile runs, an empty `SIGNATURE_DB_PASSWORD` leaves a role that cannot log in, and
+its baseline (`schemas/signature_local.sql`, `schema_version` 1) is applied to the
+empty database. The verify scripts leave `signature_svc` out until the password is set.
+
+Plus a **ninth role that owns no database**: `notification_dispatch_svc`
 (`NOTIFICATION_DISPATCH_DB_PASSWORD`). notification-dispatch's queue is
 `outbound_message`, which lives in the CRM schema so that a producer's enqueue
 rides on that producer's own transaction. So the role exists purely to hold two
@@ -44,15 +50,22 @@ as a **read-mostly** consumer. What "read-mostly" means is enforced by
 | `simulation_key_svc` | SELECT all; INSERT `audit_log` |
 | `news_board_svc` | SELECT all; INSERT `audit_log`, `notification`, `outbound_message` |
 | `billing_svc` | SELECT all; INSERT `audit_log`, `notification`, `outbound_message` |
-| `administrative_document_svc` | SELECT all; INSERT `audit_log`, `notification`, `outbound_message` |
+| `administrative_document_svc` | SELECT all; INSERT `audit_log`, `notification`, `outbound_message`, `regulatory_link_status`; UPDATE (`regulatory_status`, `valid_from`, `valid_to`, `regulatory_ref`) on `regulatory_link_status` |
 | `live_data_svc` | SELECT all; INSERT `audit_log` (the only CRM write in its code) |
+| `signature_svc` | SELECT all; INSERT `notification`, `outbound_message` (no audit: its evidence log is in `signature_local`) |
 | `notification_dispatch_svc` | SELECT all; **UPDATE** `outbound_message`; INSERT `email_suppression` |
 
-`notification_dispatch_svc` is the only role in the whole matrix holding an
-`UPDATE`, and it holds nothing else — it never enqueues a message and never writes
+`notification_dispatch_svc` is the only role in the whole matrix holding a
+table-wide `UPDATE`, and it holds nothing else — it never enqueues a message and never writes
 an audit row. The `UPDATE` is load-bearing twice over: `SELECT … FOR UPDATE SKIP
 LOCKED` requires the privilege in its own right, so the same grant covers both the
 claim loop and the CLAIMED/SENT/FAILED/SUPPRESSED transitions.
+
+The one other `UPDATE` is column-level: `administrative_document_svc` writes the
+espace administratif's regulatory effects straight into `regulatory_link_status`
+(crm schema v17+), four effect columns only. The episode's identity columns stay
+unwritable, and the trigger that aligns `meter_data` is `SECURITY DEFINER`, so the
+role needs no `meter_data` grant.
 
 Nobody but `crm_svc` holds DELETE or CREATE anywhere in `crm_db`.
 

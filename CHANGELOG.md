@@ -8,6 +8,48 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Added (espace administratif and the signature annexe)
+
+Deploy order and the hand steps: `docs/runbooks/espace-administratif-signature.md`.
+The migrator (crm v20, administrative-document v6) runs BEFORE the new annexe images
+start, document-generation's image goes out no later than the annexe's, and
+`postgres-init` runs again after the migrator (`./docker-stack.sh migrate` does both).
+
+- **`crm-outbox-relay`** (backend profile): crm-backend's image, its own process,
+  publishing `crm_db.outbox_event` to JetStream `core.evt.*` (stream CORE_EVENTS).
+  The administrative annexe opens its procedures from those events; without the
+  relay nothing opens and nothing says so. `administrative-document-worker` now
+  waits on it.
+- **The reception mailbox** on `administrative-document` (address template and IMAP
+  host) and its worker (the full `INBOUND_IMAP_*` set). Ships off: empty values = no
+  address, no polling.
+- **Grants**: `administrative_document_svc` gets INSERT and a column-level UPDATE
+  (`regulatory_status`, `valid_from`, `valid_to`, `regulatory_ref`) on
+  `regulatory_link_status`, guarded on the table existing (crm v17+) like the
+  notification grants. The verify scripts gained the matching negatives and the
+  positive upsert, withdrawal and `meter_data` alignment checks.
+- **The signature annexe**, in its own `signature` profile, **off** and never started
+  by `docker-stack.sh`: `signature` and `signature-worker` (images not published
+  yet), the `signature_svc` role and `signature_local` database (provisioned either
+  way, baseline `schemas/signature_local.sql`, added to `db-backup`), notification
+  grants for `signature_svc`, the evidence templates v1–v3 uploaded by `minio-init`,
+  and `./signature-seal/` (gitignored) for the seal. `stop` now brings the profile
+  down too.
+  - `signature-doc-gen` is in the `init` profile, not `signature`: the builder lists
+    the service unconditionally and swagger2krakend exits 1 on a missing swagger, so
+    it writes an empty spec unless `SIGNATURE_ENABLED=true`.
+  - KrakenD forwards `auth_time`, `sid` and `acr` (x-auth-time/-sid/-acr), which
+    needs a swagger2krakend image from 66c0ddf: the builder reads the image's own
+    `/app/extra-config.json`; this repo's copy mirrors it. nginx blanks those three
+    headers from the client on `/api/` and sets `X-Source-Ip` itself, in both
+    templates.
+  - The realm template's `basic` scope gained the `auth_time` mapper and `acr` its
+    `acr loa level` mapper. `--import-realm` skips an existing realm: patch the live
+    one by hand (runbook §2).
+- `key_description/v1` vendored into `document-templates/administrative-document/`.
+- **`max_connections` 300 → 350** (320 counted, the signature profile included):
+  recreates `postgres` on the next `up`.
+
 ### Added (realtime SSE and maps)
 
 - **`redis`** — the realtime ticket store and pub/sub bus, on a new `redis` network

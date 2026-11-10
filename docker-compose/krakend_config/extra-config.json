@@ -7,7 +7,10 @@
     "propagate_claims": [
       ["sub", "x-user-id"],
       ["groups", "x-user-groups"],
-      ["orgs", "x-user-orgs"]
+      ["orgs", "x-user-orgs"],
+      ["auth_time", "x-auth-time"],
+      ["sid", "x-auth-sid"],
+      ["acr", "x-auth-acr"]
     ],
     "cache": true
   }

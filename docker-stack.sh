@@ -156,9 +156,10 @@ check_frontend_config() {
 stop_stack() {
     echo "Running backups before stopping..."
     do_backup
-    # live-data included: left out, its containers keep running and `down` then
-    # fails to remove the networks they are still attached to.
-    compose -f "$COMPOSE_FILE" --profile init --profile backend --profile frontend --profile live-data down
+    # live-data and signature included: left out, their containers keep running
+    # and `down` then fails to remove the networks they are still attached to.
+    # (signature is never started by this script; it may have been by hand.)
+    compose -f "$COMPOSE_FILE" --profile init --profile backend --profile frontend --profile live-data --profile signature down
 }
 
 do_backup() {

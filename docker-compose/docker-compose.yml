@@ -96,6 +96,46 @@ services:
       - ./krakend_config:/data:z
     restart: on-failure
 
+  # The signature annexe's OpenAPI file. In the `init` profile, NOT in
+  # `signature` like the annexe itself, on purpose: krakend-builder.yaml lists
+  # the `signature` service unconditionally, swagger2krakend exits 1 on a swagger
+  # file that does not exist, and krakend-config may not depend_on a service in
+  # a profile that is off (compose rejects the whole project). A missing file
+  # would therefore stop the gateway config from being regenerated at all, for
+  # every annexe - KrakenD keeps serving the PREVIOUS krakend.json, and every
+  # route added since silently does not exist.
+  #
+  # So this always writes the file:
+  #   SIGNATURE_ENABLED=true  -> downloads the published spec, exactly like the
+  #                              other doc-gens; a failure (404, network) fails
+  #                              the init profile loudly.
+  #   anything else           -> an empty OpenAPI document: the gateway gets ZERO
+  #                              /signature routes, so a client gets KrakenD's
+  #                              404, never a 502 from an upstream that is not
+  #                              there.
+  #
+  # The signature repo has no GitHub repository yet, hence no GitHub Pages, so
+  # SIGNATURE_ENABLED=true cannot work before it does. Its
+  # update-documentation.yml publishes swagger.yml like every other annexe.
+  signature-doc-gen:
+    profiles: ["init"]
+    image: alpine/curl:latest
+    environment:
+      - SIGNATURE_ENABLED=${SIGNATURE_ENABLED:-false}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        if [ "$${SIGNATURE_ENABLED}" = "true" ]; then
+          curl -fL https://optimce.github.io/signature/swagger.yml -o /data/signature.json
+        else
+          echo "signature: off (SIGNATURE_ENABLED=$${SIGNATURE_ENABLED}) - empty spec, no gateway routes"
+          printf '%s' '{"openapi":"3.0.3","info":{"title":"signature (not deployed here)","version":"0"},"paths":{}}' > /data/signature.json
+        fi
+    volumes:
+      - ./krakend_config:/data:z
+    restart: on-failure
+
   krakend-config:
     profiles: ["init"]
     image: ghcr.io/optimce/swagger2krakend:main
@@ -122,6 +162,8 @@ services:
       administrative-document-doc-gen:
         condition: service_completed_successfully
       live-data-doc-gen:
+        condition: service_completed_successfully
+      signature-doc-gen:
         condition: service_completed_successfully
 
   keycloak-config:
@@ -225,26 +267,30 @@ services:
     # max_connections is derived from the pool variables pinned on every
     # consumer below, not guessed:
     #
-    #   9 two-pool Python processes x (CRM 5+5 + LOCAL 5+5) = 180
+    #  11 two-pool Python processes x (CRM 5+5 + LOCAL 5+5) = 220
+    #     (the 9 platform annexe processes + signature API and seal worker)
     #   3 live-data processes (API, worker, scheduler) x 20 =  60
     #   notification-dispatch (CRM pool only, 5+5)          =  10
-    #   crm-backend (node-postgres pool)                    =  10
+    #   crm-backend (node-postgres pool, default max 10)    =  10
+    #   crm-outbox-relay (same image, same pool)            =  10
     #   migrator + postgres-init + backup + admin           = ~10
     #                                                         ---
-    #                                                         270
+    #                                                         320
     #
-    # 270 of 300. The next annexe that brings its own two-pool processes must
-    # raise max_connections in the same change.
+    # 320 of 350, counting the signature profile whether or not it runs. Raised
+    # from 300 (270 used) when the relay and the signature annexe arrived. The
+    # next annexe that brings its own two-pool processes must raise
+    # max_connections in the same change; it takes effect on a postgres restart.
     #
     # The coded default in each Python service is POOL_SIZE=20 + MAX_OVERFLOW=10
-    # — 60 per two-pool process, 720 for the twelve. Spread over six instances that
+    # — 60 per two-pool process, 840 for the fourteen. Spread over six instances that
     # ceiling was never met; one instance meets all of it at once. The
     # CRM_DB_POOL_SIZE / LOCAL_DB_POOL_SIZE lines below are therefore load
     # bearing, not tuning.
     command:
       - "postgres"
       - "-c"
-      - "max_connections=300"
+      - "max_connections=350"
       - "-c"
       - "shared_buffers=256MB"
     environment:
@@ -311,6 +357,10 @@ services:
       # password, clearing password" and the role simply cannot log in — so a
       # missing line costs live-data, never the platform.
       - LIVE_DATA_DB_PASSWORD=${LIVE_DATA_DB_PASSWORD:-}
+      # Same tolerance, for the same reason: the signature profile ships OFF.
+      # Set it before the profile is first started; the verify scripts leave
+      # signature_svc out until it is.
+      - SIGNATURE_DB_PASSWORD=${SIGNATURE_DB_PASSWORD:-}
     entrypoint: ["/bin/sh", "/postgres/provision/provision.sh"]
     volumes:
       - ./postgres:/postgres:ro
@@ -328,6 +378,12 @@ services:
       # migration. live_data_local is NEW here: this file is applied on the first
       # start that sees the empty database, and never again.
       - ./schemas/live_data_local.sql:/schemas/live_data_local.sql:ro
+      # Vendored from the signature repo's scripts/sql/schema.sql (schema_version
+      # 1). signature_local is NEW: applied on the first start that sees the empty
+      # database, whether or not the signature profile runs, and never again -
+      # optimce-migrator has no signature entry yet, so its first schema change
+      # needs one.
+      - ./schemas/signature_local.sql:/schemas/signature_local.sql:ro
     networks:
       - database
 
@@ -652,9 +708,22 @@ services:
       mc mb --ignore-existing local/$${OUTPUT_BUCKET};
       mc cp --recursive /templates/billing local/$${TEMPLATES_BUCKET}/;
       mc cp --recursive /templates/administrative-document local/$${TEMPLATES_BUCKET}/;
+      mc cp --recursive /templates/signature local/$${TEMPLATES_BUCKET}/;
       exit 0;
       "
     volumes:
+      # Vendored copies of each owning service's bundles (billing,
+      # administrative-document, signature). The directory name becomes the key
+      # prefix - `mc cp` of a directory keeps it - which is what
+      # document_template.file_ref and EVIDENCE_TEMPLATE_URI point at.
+      #
+      # `cp`, not `sync`, and document-generation caches a bundle on disk by URI
+      # with no invalidation: re-uploading changed files to an EXISTING version
+      # directory has no effect until `up --force-recreate document-generation`.
+      # A changed template is a new version directory.
+      #
+      # The signature bundles are uploaded whether or not the signature profile
+      # runs: a few KB, and nothing reads them until it does.
       - ./document-templates:/templates:ro
     networks:
       - minio
@@ -850,6 +919,77 @@ services:
       # still runs and still shows red in `docker compose ps`.
       redis:
         condition: service_started
+
+  # The core's outbox relay (crm-backend's src/outbox-relay.ts). crm-backend
+  # writes an outbox_event row in the SAME transaction as the CRM change; this
+  # process publishes those rows onto JetStream `core.evt.<type>` (stream
+  # CORE_EVENTS, which it creates and owns) and stamps them sent. The
+  # administrative annexe's worker consumes the stream: without the relay, no
+  # meter, key or representative change ever opens a procedure, and nothing
+  # says so - the rows simply pile up in outbox_event.
+  #
+  # Same image as crm-backend, its own process: an API restart never stalls the
+  # relay, and the relay never competes with requests. Same role and DB
+  # variables as crm-backend (it only reads and stamps outbox_event), but none
+  # of the IAM / storage / realtime settings - the relay entrypoint reads only
+  # the database, the logger and `outbox_relay` from config/production.cjs.
+  #
+  # ONE REPLICA. A second one would be safe (rows are claimed FOR UPDATE SKIP
+  # LOCKED, and Nats-Msg-Id dedup absorbs a replay inside the duplicate window)
+  # but buys nothing at this size.
+  #
+  # Needs a crm_db at schema v16+ (outbox_event, optimce-migrator) and a
+  # crm-backend image carrying src/outbox-relay.ts: start it AFTER the migrator,
+  # never before. On an older schema it fails on the missing table and restarts.
+  crm-outbox-relay:
+    profiles: ["backend"]
+    image: ghcr.io/optimce/crm-backend:main
+    # node directly, not `npm run relay`: the relay drains on SIGTERM, and npm
+    # in front of it as PID 1 would get the signal instead.
+    command: ["node", "dist/src/outbox-relay.js"]
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - MICROSERVICE_NAME=crm-outbox-relay
+      - REMOTE_LOGGING=${REMOTE_LOGGING}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT}
+      - OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+      - DB_TYPE=postgres
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USERNAME=crm_svc
+      - DB_PASSWORD=${CRM_DB_PASSWORD}
+      - DB_NAME=crm_db
+      # Read by config/production.cjs whichever entrypoint loads it; kept
+      # identical to crm-backend's, with the same mount, as the dev stack does.
+      - REGULATORS_CONFIG_PATH=/app/reference/regulators.json
+      - NATS_URL=nats://nats:4222
+      # Pinned rather than inherited, like every other knob in this file. The
+      # relay brings CORE_EVENTS to this max_age on every start (it creates the
+      # stream, or updates it), so a change takes effect on the next restart.
+      - OUTBOX_RELAY_POLL_INTERVAL_MS=${OUTBOX_RELAY_POLL_INTERVAL_MS:-500}
+      - OUTBOX_STREAM_MAX_AGE_DAYS=${OUTBOX_STREAM_MAX_AGE_DAYS:-30}
+    volumes:
+      - ./reference:/app/reference:ro
+    networks:
+      - database
+      - nats
+      - opentelemetry
+    healthcheck:
+      # The loop touches this heartbeat on every turn, also while idle, so a
+      # wedged loop shows as unhealthy rather than "running".
+      test: ["CMD-SHELL", "find /tmp/outbox-relay.alive -mmin -1 | grep -q . || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      postgres-init:
+        condition: service_completed_successfully
+      nats:
+        condition: service_healthy
 
   allocation-key-generation:
     profiles: ["backend"]
@@ -1336,6 +1476,17 @@ services:
       # crash-loops all nine annexe services at boot.
       - REALTIME_ENABLED=${REALTIME_ENABLED:-false}
       - REALTIME_REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/1
+      # ---- The reception address (espace administratif, phase 4) ----------
+      # Each community gets this template with `{token}` replaced by its own
+      # random 12-character token, e.g. demarches+{token}@<domain>; the worker
+      # finds the community from that token in the recipient address, so the
+      # mailbox must deliver plus-addressed mail to one inbox. The API only
+      # SHOWS the address, and only where a mailbox is read, so it needs the
+      # IMAP host too (api/admin/inbound.enabled) - never the credentials, which
+      # stay on the worker. Either one empty: no address, the hub shows none,
+      # and nothing is polled.
+      - INBOUND_ADDRESS_TEMPLATE=${INBOUND_ADDRESS_TEMPLATE:-}
+      - INBOUND_IMAP_HOST=${INBOUND_IMAP_HOST:-}
       - LOGGING_TOKEN=${LOGGING_TOKEN}
       - LOGGING_TRACES_URL=${LOGGING_TRACES_URL}
       - LOGGING_LOGS_URL=${LOGGING_LOGS_URL}
@@ -1396,6 +1547,19 @@ services:
       # crash-loops all nine annexe services at boot.
       - REALTIME_ENABLED=${REALTIME_ENABLED:-false}
       - REALTIME_REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/1
+      # ---- The reception address (phase 4) - see the API above ------------
+      # This worker polls ONE mailbox by IMAP and files each mail on the
+      # community whose token it finds in the recipient address. No host: no
+      # polling. `:-` defaults throughout: PORT and SSL are an int and a bool on
+      # the settings model, and pydantic refuses the empty string compose
+      # renders for an undefined variable.
+      - INBOUND_ADDRESS_TEMPLATE=${INBOUND_ADDRESS_TEMPLATE:-}
+      - INBOUND_IMAP_HOST=${INBOUND_IMAP_HOST:-}
+      - INBOUND_IMAP_PORT=${INBOUND_IMAP_PORT:-993}
+      - INBOUND_IMAP_SSL=${INBOUND_IMAP_SSL:-true}
+      - INBOUND_IMAP_USER=${INBOUND_IMAP_USER:-}
+      - INBOUND_IMAP_PASSWORD=${INBOUND_IMAP_PASSWORD:-}
+      - INBOUND_POLL_SECONDS=${INBOUND_POLL_SECONDS:-120}
       - LOGGING_TOKEN=${LOGGING_TOKEN}
       - LOGGING_TRACES_URL=${LOGGING_TRACES_URL}
       - LOGGING_LOGS_URL=${LOGGING_LOGS_URL}
@@ -1425,6 +1589,12 @@ services:
       # And docgen, so its DOCGEN_RESULTS stream usually exists before we bind
       # to it. The background subscribe-retry is the real guarantee.
       document-generation:
+        condition: service_started
+      # And the relay, for the same reason: it creates CORE_EVENTS, which the
+      # core-events consumer binds. That retry gives up after ~20 min and the
+      # consumer then stays off until this worker restarts - with no procedure
+      # ever opened by a CRM change, and nothing in `docker compose ps` to show.
+      crm-outbox-relay:
         condition: service_started
 
   # The only thing in the platform that sends email. Worker-only, like
@@ -1781,6 +1951,206 @@ services:
         condition: service_completed_successfully
 
   # ============================================
+  # SIGNATURE PROFILE - in-app electronic signature (the signature annexe)
+  # ============================================
+  # PAdES signature of platform PDFs in the app (V1: the CWaPE annexe 8 that the
+  # administrative annexe collects), sealed by the platform with pyHanko, with a
+  # hash-chained evidence log and a docgen-rendered evidence report.
+  #
+  # Its OWN profile and OFF by default, like live-data, for three reasons none
+  # of which is visible from inside the stack:
+  #   * the images do not exist yet: the signature repo has no GitHub
+  #     repository, so ghcr.io/optimce/signature:main-prod / :main-worker are
+  #     not published, and a `--profile signature pull` fails;
+  #   * the seal certificate is UNDECIDED (who holds it, which type, PKCS#12 or
+  #     HSM/cloud key): the worker loads it on the first seal, so without one
+  #     every request fails at completion and lands in the DLQ;
+  #   * ENV=production refuses to boot BOTH containers without TSA_URLS (one
+  #     shared settings check), and the timestamp authority is not chosen yet
+  #     either (a qualified TSA on an EU trusted list).
+  #
+  # Turning it on (docs/runbooks/espace-administratif-signature.md):
+  #   SIGNATURE_DB_PASSWORD, SIGNATURE_TSA_URLS, the seal files in
+  #   ./signature-seal/ and SIGNATURE_SEAL_* in .env; SIGNATURE_ENABLED=true so
+  #   the init profile downloads the real spec (signature-doc-gen); re-run init
+  #   and restart krakend; then
+  #     docker compose --profile backend --profile signature up -d
+  #   then restart administrative-document-worker (its signature-events consumer
+  #   gives up retrying after ~20 min) and only THEN offer the module with
+  #   ANNEX_CATALOG_ENABLE=signature on crm-backend.
+  #
+  # Same two consequences of a separate profile as live-data:
+  #   * every compose command that names these services must ALSO enable
+  #     `--profile backend` (postgres, postgres-init, nats, minio-init and
+  #     document-generation live there);
+  #   * nothing outside this section depends on them. krakend does not wait for
+  #     `signature`: KrakenD resolves the host per request, so only /signature/*
+  #     fails while it is down. administrative-document publishes on
+  #     signature.request.* and binds signature.event.* in the background, so it
+  #     runs unchanged without them.
+  signature:
+    profiles: ["signature"]
+    image: ghcr.io/optimce/signature:main-prod
+    restart: unless-stopped
+    environment:
+      - ENV=production
+      - CRM_DATABASE_URL=postgresql+asyncpg://signature_svc:${SIGNATURE_DB_PASSWORD:-}@postgres:5432/crm_db
+      - LOCAL_DATABASE_URL=postgresql+asyncpg://signature_svc:${SIGNATURE_DB_PASSWORD:-}@postgres:5432/signature_local
+      # Pinned, not inherited: the coded default is 20+10 per pool, and the
+      # max_connections arithmetic on `postgres` counts 5+5.
+      - CRM_DB_POOL_SIZE=5
+      - CRM_DB_MAX_OVERFLOW=5
+      - LOCAL_DB_POOL_SIZE=5
+      - LOCAL_DB_MAX_OVERFLOW=5
+      - NATS_URL=nats://nats:4222
+      - ALLOW_ORIGIN=${APP_CORS_ALLOWED_ORIGIN}
+      - STORAGE_ENDPOINT=http://minio:9000
+      - STORAGE_BUCKET=${STORAGE_BUCKET}
+      # Originals are read under the requesting domain's prefix; everything of
+      # a request is written under signature/{community}/{request}/.
+      - OUTPUT_BUCKET=${OUTPUT_BUCKET}
+      # Holds the evidence report's bundle (minio-init uploads it from
+      # ./document-templates/signature); document-generation reads it.
+      - TEMPLATES_BUCKET=${TEMPLATES_BUCKET}
+      - STORAGE_ACCESS_KEY=${MINIO_ROOT_USER}
+      - STORAGE_SECRET_KEY=${MINIO_ROOT_PASSWORD}
+      - STORAGE_REGION=us-east-1
+      # document-generation's DOCGEN_RESULTS stream filters on `docgen.result.>`,
+      # so this subject needs no stream change.
+      - DOCGEN_REQUEST_SUBJECT=docgen.request
+      - DOCGEN_RESULT_SUBJECT=docgen.result.signature
+      # v3 is the current report (« Qualité », dd/mm/yyyy times). A new version
+      # is a new directory under document-templates/signature/evidence/ AND this
+      # line, in the same release - docgen caches a bundle by URI.
+      - EVIDENCE_TEMPLATE_URI=s3://${TEMPLATES_BUCKET}/signature/evidence/v3/
+      # The sign call needs an interactive login at most this old: the token's
+      # auth_time, forwarded by KrakenD as x-auth-time (extra-config.json) and
+      # set only by a browser login (the realm's auth_time mapper). Production
+      # refuses 0.
+      - STEP_UP_MAX_AGE_SECONDS=${SIGNATURE_STEP_UP_MAX_AGE_SECONDS:-300}
+      # Required by the shared production settings check on the API too, even
+      # though only the worker stamps.
+      - TSA_URLS=${SIGNATURE_TSA_URLS:-}
+      # Where the in-app links of its notifications point. The coded default is
+      # the dev SPA (http://localhost:8087).
+      - APP_BASE_URL=${DOMAIN}
+      # Realtime (SSE hints) - fire-and-forget; see the note on news-board.
+      - REALTIME_ENABLED=${REALTIME_ENABLED:-false}
+      - REALTIME_REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/1
+      - LOGGING_TOKEN=${LOGGING_TOKEN}
+      - LOGGING_TRACES_URL=${LOGGING_TRACES_URL}
+      - LOGGING_LOGS_URL=${LOGGING_LOGS_URL}
+      - LOGGING_METRICS_URL=${LOGGING_METRICS_URL}
+    networks:
+      - api-gateway
+      - crm
+      - database
+      - nats
+      - minio
+      - opentelemetry
+      - redis
+    depends_on:
+      postgres:
+        condition: service_healthy
+      postgres-init:
+        condition: service_completed_successfully
+      nats:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health/readiness', timeout=3).status==200 else 1)\""
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 45s
+
+  # The seal worker: prepares, seals and completes requests (the final revision
+  # is PAdES-B-LTA: seal, document timestamp, validation data). The ONLY
+  # container that holds the seal; the API never sees it. One replica, as in
+  # the development stack.
+  signature-worker:
+    profiles: ["signature"]
+    image: ghcr.io/optimce/signature:main-worker
+    restart: unless-stopped
+    # A seal in flight finishes before the drain (25 s) ends.
+    stop_grace_period: 60s
+    environment:
+      - ENV=production
+      - CRM_DATABASE_URL=postgresql+asyncpg://signature_svc:${SIGNATURE_DB_PASSWORD:-}@postgres:5432/crm_db
+      - LOCAL_DATABASE_URL=postgresql+asyncpg://signature_svc:${SIGNATURE_DB_PASSWORD:-}@postgres:5432/signature_local
+      - CRM_DB_POOL_SIZE=5
+      - CRM_DB_MAX_OVERFLOW=5
+      - LOCAL_DB_POOL_SIZE=5
+      - LOCAL_DB_MAX_OVERFLOW=5
+      - NATS_URL=nats://nats:4222
+      - ALLOW_ORIGIN=${APP_CORS_ALLOWED_ORIGIN}
+      - STORAGE_ENDPOINT=http://minio:9000
+      - STORAGE_BUCKET=${STORAGE_BUCKET}
+      - OUTPUT_BUCKET=${OUTPUT_BUCKET}
+      - TEMPLATES_BUCKET=${TEMPLATES_BUCKET}
+      - STORAGE_ACCESS_KEY=${MINIO_ROOT_USER}
+      - STORAGE_SECRET_KEY=${MINIO_ROOT_PASSWORD}
+      - STORAGE_REGION=us-east-1
+      - DOCGEN_REQUEST_SUBJECT=docgen.request
+      - DOCGEN_RESULT_SUBJECT=docgen.result.signature
+      - EVIDENCE_TEMPLATE_URI=s3://${TEMPLATES_BUCKET}/signature/evidence/v3/
+      - STEP_UP_MAX_AGE_SECONDS=${SIGNATURE_STEP_UP_MAX_AGE_SECONDS:-300}
+      - APP_BASE_URL=${DOMAIN}
+      # ---- The seal (OPEN DECISION: certificate holder, type, HSM or not) ----
+      # A PKCS#12 file in ./signature-seal/ on the host (gitignored, never in
+      # this repo), mounted read-only into this container only. The image runs
+      # as the system user `app`: the file must be readable by that uid
+      # (`docker compose run --rm --no-deps --entrypoint id signature-worker`).
+      # Loaded on the first seal, not at boot, so a missing file shows up as
+      # failed requests in the DLQ, not as a crash loop.
+      - SEAL_PKCS12_PATH=/seal/seal.p12
+      - SEAL_PKCS12_PASSPHRASE=${SIGNATURE_SEAL_PKCS12_PASSPHRASE:-}
+      # Comma-separated paths under /seal: extra CA certificates when the
+      # PKCS#12 lacks its chain, and the trust anchors for the validation data
+      # embedded at completion (the seal's root).
+      - SEAL_CA_CHAIN_PATHS=${SIGNATURE_SEAL_CA_CHAIN_PATHS:-}
+      - SEAL_TRUST_ROOT_PATHS=${SIGNATURE_SEAL_TRUST_ROOT_PATHS:-}
+      # RFC 3161 timestamp authorities, tried in order (comma-separated URLs).
+      # A TSA down = 4 tries, then FAILED and the DLQ.
+      - TSA_URLS=${SIGNATURE_TSA_URLS:-}
+      - REALTIME_ENABLED=${REALTIME_ENABLED:-false}
+      - REALTIME_REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/1
+      - LOGGING_TOKEN=${LOGGING_TOKEN}
+      - LOGGING_TRACES_URL=${LOGGING_TRACES_URL}
+      - LOGGING_LOGS_URL=${LOGGING_LOGS_URL}
+      - LOGGING_METRICS_URL=${LOGGING_METRICS_URL}
+    volumes:
+      - ./signature-seal:/seal:ro
+    # NO compose healthcheck: Dockerfile.worker carries its own, on the mtime of
+    # /tmp/worker.alive (start period 600 s). Reaching the TSA needs no extra
+    # network: any bridge network has outbound access.
+    networks:
+      - crm
+      - database
+      - nats
+      - minio
+      - opentelemetry
+      - redis
+    depends_on:
+      postgres:
+        condition: service_healthy
+      postgres-init:
+        condition: service_completed_successfully
+      nats:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      # The API declares the streams this worker consumes.
+      signature:
+        condition: service_started
+      # And docgen renders the evidence report.
+      document-generation:
+        condition: service_started
+
+  # ============================================
   # MIGRATION PROFILE - CRM schema migrations
   # ============================================
   # Runs as crm_svc, NOT as the superuser. That is deliberate: ALTER DEFAULT
@@ -1956,7 +2326,7 @@ services:
         TS=$$(date +%Y%m%d_%H%M%S) ;
         rc=0 ;
         pg_dumpall --globals-only -f /backups/globals_$$TS.sql || rc=1 ;
-        for pair in crm_db:crm_db allocation_key_local:allocation_key simulation_key_local:simulation_key news_board_local:news_board billing_local:billing administrative_document_local:administrative_document live_data_local:live_data ; do
+        for pair in crm_db:crm_db allocation_key_local:allocation_key simulation_key_local:simulation_key news_board_local:news_board billing_local:billing administrative_document_local:administrative_document live_data_local:live_data signature_local:signature ; do
           db=$${pair%%:*} ; name=$${pair##*:} ;
           echo "dumping $$db" ;
           pg_dump -d "$$db" -f "/backups/$${name}_$$TS.sql" || { echo "$$db FAILED" ; rc=1 ; } ;
@@ -2059,7 +2429,8 @@ networks:
   opentelemetry:
   # The realtime ticket store and pub/sub bus. Membership IS the access-control
   # list: crm-backend (the hub, which mints tickets and fans out) plus the nine
-  # publishers, and nothing else.
+  # publishers, plus signature and signature-worker when the signature profile
+  # runs, and nothing else. crm-outbox-relay is deliberately not on it.
   #
   # A dedicated network rather than reusing `crm` - which all ten of those
   # services already share - because `crm` is the network every NEW annexe joins

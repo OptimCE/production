@@ -5,19 +5,25 @@
 -- into something the database enforces, rather than something the code
 -- promises. Before consolidation every service reached crm_db as the superuser.
 --
--- Seven roles reach crm_db without owning it:
+-- Eight roles reach crm_db without owning it:
 --
 --   allocation_key_svc          SELECT + audit + its own domain cascade
 --   simulation_key_svc          SELECT + audit
 --   news_board_svc              SELECT + audit + notifications
 --   billing_svc                 SELECT + audit + notifications
---   administrative_document_svc SELECT + audit + notifications
+--   administrative_document_svc SELECT + audit + notifications + its regulatory
+--                               effects (regulatory_link_status, four columns)
 --   live_data_svc               SELECT + audit (core/audit_log only; checked:
 --                               no other statement reaches its CRM session)
+--   signature_svc               SELECT + notifications, and NO audit: it keeps
+--                               its own hash-chained evidence log in
+--                               signature_local
 --   notification_dispatch_svc   SELECT + the delivery loop, and nothing else
 --
 -- notification_dispatch_svc is the odd one out in both directions: it owns no
--- database at all, and it is the only role holding an UPDATE anywhere in crm_db.
+-- database at all, and it holds the only TABLE-wide UPDATE in crm_db. The one
+-- other UPDATE is administrative_document_svc's, on four named columns of
+-- regulatory_link_status.
 -- ===========================================================================
 \set ON_ERROR_STOP on
 
@@ -56,7 +62,8 @@ GRANT USAGE ON SCHEMA public TO
     billing_svc,
     administrative_document_svc,
     notification_dispatch_svc,
-    live_data_svc;
+    live_data_svc,
+    signature_svc;
 
 -- Not retroactive is the whole reason this runs on EVERY start rather than once:
 -- it covers tables that already existed when a role was added, and tables an
@@ -73,7 +80,8 @@ GRANT SELECT ON ALL TABLES IN SCHEMA public TO
     billing_svc,
     administrative_document_svc,
     notification_dispatch_svc,
-    live_data_svc;
+    live_data_svc,
+    signature_svc;
 
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO
     allocation_key_svc,
@@ -82,7 +90,8 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO
     billing_svc,
     administrative_document_svc,
     notification_dispatch_svc,
-    live_data_svc;
+    live_data_svc,
+    signature_svc;
 
 -- ---------------------------------------------------------------------------
 -- Writes — narrow, one row per verified call site, and every one of them
@@ -127,9 +136,27 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO
 --
 -- Call sites, for the record:
 --   audit_log                            core/audit_log/service.py, all six annexes
+--                                        (not signature: its evidence log is its own)
 --   allocation_key, iteration, consumer  one ORM flush cascades into all three
 --                                        (allocation-key-generation only)
 --   notification, outbound_message       core/notifications/, producers only
+--                                        (signature since 2026-11-03: invitations,
+--                                        reminders, completions)
+--   regulatory_link_status INSERT +      administrative-document's effects port
+--     UPDATE of its four effect columns  (ports/core_effects*.py): it opens an
+--                                        episode and moves regulatory_status,
+--                                        valid_from, valid_to, regulatory_ref with
+--                                        INSERT ... ON CONFLICT DO UPDATE, which
+--                                        needs exactly those columns plus SELECT.
+--                                        Without them every effect write is
+--                                        refused and procedures never go in force.
+--                                        The episode's identity (community,
+--                                        operation, subject, dossier of origin)
+--                                        stays unwritable. GENERATED ALWAYS AS
+--                                        IDENTITY: no sequence grant. The trigger
+--                                        that aligns meter_data is SECURITY
+--                                        DEFINER, so no meter_data grant either.
+--                                        Arrives with crm schema v17+ (migrator).
 --   outbound_message UPDATE              notification-dispatch's claim loop:
 --                                        SELECT ... FOR UPDATE SKIP LOCKED needs
 --                                        UPDATE in its own right, and the same
@@ -140,8 +167,9 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO
 DO $$
 DECLARE
     ANNEXES   CONSTANT text := 'allocation_key_svc, simulation_key_svc, news_board_svc, billing_svc, administrative_document_svc, live_data_svc';
-    PRODUCERS CONSTANT text := 'news_board_svc, billing_svc, administrative_document_svc';
+    PRODUCERS CONSTANT text := 'news_board_svc, billing_svc, administrative_document_svc, signature_svc';
     DISPATCH  CONSTANT text := 'notification_dispatch_svc';
+    EFFECTS   CONSTANT text := 'administrative_document_svc';
     g                  record;
     missing            text[] := '{}';
 BEGIN
@@ -153,13 +181,19 @@ BEGIN
             ('notification',      'notification_id_seq',     'INSERT', PRODUCERS,            false),
             ('outbound_message',  'outbound_message_id_seq', 'INSERT', PRODUCERS,            false),
             ('outbound_message',  NULL,                      'UPDATE', DISPATCH,             false),
-            ('email_suppression', NULL,                      'INSERT', DISPATCH,             false)
+            ('email_suppression', NULL,                      'INSERT', DISPATCH,             false),
+            -- A column-level privilege goes in `priv` whole: format('%s') pastes
+            -- it in front of ON, which is exactly the GRANT syntax.
+            ('regulatory_link_status', NULL,                 'INSERT', EFFECTS,              false),
+            ('regulatory_link_status', NULL,
+                'UPDATE (regulatory_status, valid_from, valid_to, regulatory_ref)', EFFECTS, false)
         ) AS v(tbl, seq, priv, grantees, expected)
     LOOP
         IF to_regclass('public.' || g.tbl) IS NULL THEN
             IF g.expected THEN
-                -- One entry per table, not per grant: outbound_message appears
-                -- on two rows and must not be reported twice.
+                -- One entry per table, not per grant: outbound_message and
+                -- regulatory_link_status appear on two rows each and must not be
+                -- reported twice.
                 IF NOT (g.tbl = ANY (missing)) THEN
                     missing := missing || g.tbl;
                 END IF;
@@ -188,13 +222,17 @@ RESET ROLE;
 -- What is deliberately NOT granted, because that is the point:
 --
 --   * No DELETE on anything. No service issues one against crm_db.
---   * No UPDATE for any annexe, on any table. The single UPDATE in the whole
---     matrix is notification_dispatch_svc on outbound_message.
+--   * No table-wide UPDATE for any annexe. The matrix holds two UPDATEs:
+--     notification_dispatch_svc on outbound_message, and
+--     administrative_document_svc on the four effect columns of
+--     regulatory_link_status — never its identity columns, never another table.
 --   * notification_dispatch_svc never inserts a notification, never inserts an
 --     outbound_message, and never writes an audit row. It owns the delivery
 --     loop and the bounce record, nothing else.
---   * No INSERT on community, app_user, member, meter, document,
+--   * No INSERT on community, app_user, member, meter, meter_data, document,
 --     sharing_operation, municipality, ... for anyone but crm_svc.
+--   * signature_svc writes no audit row and no domain row: its CRM writes are
+--     notifications only.
 --   * No CREATE on schema public for anyone but crm_svc — no annexe can run DDL
 --     against the CRM.
 --   * No role for keycloak: it is on a separate instance and cannot resolve a
