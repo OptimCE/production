@@ -114,9 +114,10 @@ services:
   #                              404, never a 502 from an upstream that is not
   #                              there.
   #
-  # The signature repo has no GitHub repository yet, hence no GitHub Pages, so
-  # SIGNATURE_ENABLED=true cannot work before it does. Its
-  # update-documentation.yml publishes swagger.yml like every other annexe.
+  # The signature repo publishes swagger.yml on GitHub Pages from its
+  # update-documentation.yml, like every other annexe. SIGNATURE_ENABLED=true
+  # also makes docker-stack.sh start the signature profile (start_signature),
+  # so the routes and the containers come and go together.
   signature-doc-gen:
     profiles: ["init"]
     image: alpine/curl:latest
@@ -273,11 +274,12 @@ services:
     #   notification-dispatch (CRM pool only, 5+5)          =  10
     #   crm-backend (node-postgres pool, default max 10)    =  10
     #   crm-outbox-relay (same image, same pool)            =  10
+    #   crm-export-worker (same image, same pool)           =  10
     #   migrator + postgres-init + backup + admin           = ~10
     #                                                         ---
-    #                                                         320
+    #                                                         330
     #
-    # 320 of 350, counting the signature profile whether or not it runs. Raised
+    # 330 of 350, counting the signature profile whether or not it runs. Raised
     # from 300 (270 used) when the relay and the signature annexe arrived. The
     # next annexe that brings its own two-pool processes must raise
     # max_connections in the same change; it takes effect on a postgres restart.
@@ -415,9 +417,11 @@ services:
     profiles: ["backend"]
     image: nats:2.10-alpine
     restart: unless-stopped
-    command: ["-js", "-m", "8222", "-sd", "/data"]
+    # nats.conf only raises max_payload (see the file); the rest stays on flags.
+    command: ["-c", "/etc/nats/optimce.conf", "-js", "-m", "8222", "-sd", "/data"]
     volumes:
       - nats_data:/data
+      - ./nats/nats.conf:/etc/nats/optimce.conf:ro
     networks:
       - nats
     healthcheck:
@@ -515,10 +519,18 @@ services:
   # recipes; here the equivalent is `docker compose exec`.
   best-address:
     profiles: ["backend"]
-    # 2026-35 = the ISO week-35 2026 extract, published 2026-08-31. Kept
+    # 2026-47 = the ISO week-47 2026 extract, published 2026-11-23. Kept
     # byte-identical to the monorepo's pin so development and production resolve
-    # the same addresses; Renovate moves both.
-    image: bosa/opendata-best-webapi:2026-35@sha256:371165f3e370e3d8476202bacea4c74bcbc8a02f944671b968826bcd64b6cf18
+    # the same addresses.
+    #
+    # THE PIN EXPIRES: the publisher keeps only the last ten weekly tags on Docker
+    # Hub, digests included (checked 2026-11-25: 2026-38 to 2026-47, and 2026-35
+    # was gone). A host that already holds the image keeps starting and pulling
+    # it; a host that does not (a new one, or after an image prune) fails the
+    # whole pull. Move the pin at least every ten weeks - 2026-47 leaves around
+    # the end of January 2027 - and never prune this image while the pin is
+    # older than that. About 6 GB unpacked: check `df -h` before pulling.
+    image: bosa/opendata-best-webapi:2026-47@sha256:395797cb6d17bd267941b9e6ac16dda6b5d561d4e1dc3633136c15ad550f9320
     restart: unless-stopped
     environment:
       - SERVER_PORT=8080
@@ -699,6 +711,29 @@ services:
       - STORAGE_BUCKET=${STORAGE_BUCKET}
       - TEMPLATES_BUCKET=${TEMPLATES_BUCKET}
       - OUTPUT_BUCKET=${OUTPUT_BUCKET}
+      # ---- Data export (README, "Data export") -----------------------------
+      # minio/export/provision.sh creates the `exports` bucket and its lifecycle,
+      # one account per producing service (writes exports/parts/*/<service>/
+      # only), export-worker and export-download. The two document buckets are
+      # the ones the worker may copy a referenced file from.
+      #
+      # `:?`, not `:-`, on every secret: provision.sh refuses to create an
+      # account without one. A .env that lacks one makes compose refuse EVERY
+      # command up front - before `stop` has taken anything down - naming the
+      # missing variable. All ten are needed even while the signature or
+      # live-data profile is off: their accounts are created either way, like
+      # their database roles.
+      - EXPORT_DOCUMENT_BUCKETS=${STORAGE_BUCKET} ${OUTPUT_BUCKET}
+      - EXPORT_CRM_SECRET=${EXPORT_CRM_SECRET:?see docker-compose/.env.example}
+      - EXPORT_SIGNATURE_SECRET=${EXPORT_SIGNATURE_SECRET:?see docker-compose/.env.example}
+      - EXPORT_ADMINISTRATIVE_DOCUMENT_SECRET=${EXPORT_ADMINISTRATIVE_DOCUMENT_SECRET:?see docker-compose/.env.example}
+      - EXPORT_BILLING_SECRET=${EXPORT_BILLING_SECRET:?see docker-compose/.env.example}
+      - EXPORT_NEWS_BOARD_SECRET=${EXPORT_NEWS_BOARD_SECRET:?see docker-compose/.env.example}
+      - EXPORT_SIMULATION_KEY_SECRET=${EXPORT_SIMULATION_KEY_SECRET:?see docker-compose/.env.example}
+      - EXPORT_ALLOCATION_KEY_GENERATION_SECRET=${EXPORT_ALLOCATION_KEY_GENERATION_SECRET:?see docker-compose/.env.example}
+      - EXPORT_LIVE_DATA_SECRET=${EXPORT_LIVE_DATA_SECRET:?see docker-compose/.env.example}
+      - EXPORT_WORKER_SECRET=${EXPORT_WORKER_SECRET:?see docker-compose/.env.example}
+      - EXPORT_DOWNLOAD_SECRET=${EXPORT_DOWNLOAD_SECRET:?see docker-compose/.env.example}
     entrypoint: >
       /bin/sh -c "
       sleep 5;
@@ -709,6 +744,7 @@ services:
       mc cp --recursive /templates/billing local/$${TEMPLATES_BUCKET}/;
       mc cp --recursive /templates/administrative-document local/$${TEMPLATES_BUCKET}/;
       mc cp --recursive /templates/signature local/$${TEMPLATES_BUCKET}/;
+      bash /export/provision.sh || echo 'ERROR: the data export storage is not fully provisioned - exports will fail. Fix the cause above, then re-run minio-init.';
       exit 0;
       "
     volumes:
@@ -725,6 +761,17 @@ services:
       # The signature bundles are uploaded whether or not the signature profile
       # runs: a few KB, and nothing reads them until it does.
       - ./document-templates:/templates:ro
+      # The data export's bucket, lifecycle and account policies: a vendored
+      # copy of the monorepo's minio/export/ (LF, see .gitattributes). bash,
+      # not sh: the script templates with ${var//pattern/replacement}; the
+      # pinned pgsty/mc image ships bash 5.1, mktemp and tr (checked 2026-11-23).
+      #
+      # NON-FATAL, unlike development: document-generation, billing,
+      # administrative-document and signature gate on this job, and a failed gate
+      # makes `up` fail and docker-stack.sh stop before the reverse proxy. The
+      # export is the only feature that needs these accounts; README, "Data
+      # export", says how to check the ten of them after a deploy.
+      - ./minio/export:/export:ro
     networks:
       - minio
 
@@ -884,6 +931,38 @@ services:
       # sequential calls, and both must fit KrakenD's 3000 ms global timeout.
       - DSO_LOOKUP_URL=${DSO_LOOKUP_URL-http://dso-lookup:8000}
       - DSO_LOOKUP_TIMEOUT_MS=${DSO_LOOKUP_TIMEOUT_MS:-1000}
+      # ---- The data export (RGPD art. 15 and 20) ---------------------------
+      # POST /exports creates the job and its parts, then announces it on NATS
+      # (`export.job.requested`, stream EXPORTS) - in the background: an export
+      # made while NATS is away waits for crm-export-worker's sweep, and an
+      # unreachable NATS never fails the boot. This process also answers the
+      # `crm` part, with the export-crm account (exports/parts/*/crm/ only).
+      - NATS_URL=nats://nats:4222
+      - EXPORT_STORAGE_ENDPOINT=http://minio:9000
+      - EXPORT_STORAGE_REGION=us-east-1
+      - EXPORT_STORAGE_ACCESS_KEY=export-crm
+      - EXPORT_STORAGE_SECRET_KEY=${EXPORT_CRM_SECRET}
+      # Download links are signed with export-download, which may only read
+      # archives/, for MinIO AS THE BROWSER REACHES IT (the s3.<domain> vhost):
+      # signing makes no network call. https, or the browser blocks the
+      # download from the https app. Either key empty: every download is a
+      # 503 35008, with no boot log.
+      - EXPORT_DOWNLOAD_ACCESS_KEY=export-download
+      - EXPORT_DOWNLOAD_SECRET_KEY=${EXPORT_DOWNLOAD_SECRET}
+      - EXPORT_DOWNLOAD_PUBLIC_ENDPOINT=${MINIO_PUBLIC_ENDPOINT}
+      # The services asked for a part of EVERY export. Required, no default:
+      # list exactly the ones that run here with their export account. One
+      # that is listed but never answers (its profile off, its image too old)
+      # fails every export after 3 x 30 min; one that runs but is not listed
+      # is silently missing from every archive.
+      - EXPORT_SERVICES=${EXPORT_SERVICES:?see docker-compose/.env.example}
+      # DoS ceilings and retention, pinned like the realtime knobs above.
+      # EXPORT_RETENTION_DAYS must stay below the `archives/` lifecycle rule
+      # (8 days, minio/export/lifecycle.json); keep it equal on the worker.
+      - EXPORT_RETENTION_DAYS=${EXPORT_RETENTION_DAYS:-7}
+      - EXPORT_MAX_REQUESTS_PER_DAY=${EXPORT_MAX_REQUESTS_PER_DAY:-3}
+      - EXPORT_STEP_UP_MAX_AGE_SECONDS=${EXPORT_STEP_UP_MAX_AGE_SECONDS:-300}
+      - EXPORT_DOWNLOAD_URL_TTL_SECONDS=${EXPORT_DOWNLOAD_URL_TTL_SECONDS:-300}
     volumes:
       - ./reference:/app/reference:ro
     networks:
@@ -892,6 +971,8 @@ services:
       - database
       - keycloak
       - minio
+      # The data export only (NATS_URL above).
+      - nats
       - opentelemetry
       - redis
       # crm-backend is the ONLY member of this network - see the `best-address`
@@ -991,6 +1072,77 @@ services:
       nats:
         condition: service_healthy
 
+  # The data export's worker (crm-backend's src/export-worker.ts; the contract is
+  # contracts/export/README.md in the monorepo). It starts each export, asks every
+  # service in crm-backend's EXPORT_SERVICES for its part over NATS (stream
+  # EXPORTS), assembles the ZIP as a stream into MinIO, notifies the requester and
+  # expires the archives. Same image as crm-backend, its own process: the API
+  # never assembles a ZIP. Its only CRM state is export_job / export_part, so it
+  # picks up where it was after a restart.
+  #
+  # Storage account export-worker (minio/export/provision.sh): reads everything
+  # in `exports` and both document buckets, writes archives/ only. Without its
+  # EXPORT_STORAGE_* it throws at boot and restarts.
+  #
+  # Needs a crm_db at schema v21+ (export_job, optimce-migrator): start it AFTER
+  # the migrator, never before.
+  crm-export-worker:
+    profiles: ["backend"]
+    image: ghcr.io/optimce/crm-backend:main
+    # node directly, not `npm run export-worker`: the worker releases its leases
+    # on SIGTERM, and npm in front of it as PID 1 would get the signal instead.
+    command: ["node", "dist/src/export-worker.js"]
+    restart: unless-stopped
+    # An assembly in flight is handed back (with a refund of its attempt) on
+    # SIGTERM; give it the same grace as the NATS workers.
+    stop_grace_period: 60s
+    environment:
+      - NODE_ENV=production
+      - MICROSERVICE_NAME=crm-export-worker
+      - REMOTE_LOGGING=${REMOTE_LOGGING}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT}
+      - OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+      - DB_TYPE=postgres
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USERNAME=crm_svc
+      - DB_PASSWORD=${CRM_DB_PASSWORD}
+      - DB_NAME=crm_db
+      # Read by config/production.cjs whichever entrypoint loads it; same mount
+      # as crm-backend.
+      - REGULATORS_CONFIG_PATH=/app/reference/regulators.json
+      - NATS_URL=nats://nats:4222
+      - EXPORT_STORAGE_ENDPOINT=http://minio:9000
+      - EXPORT_STORAGE_REGION=us-east-1
+      - EXPORT_STORAGE_ACCESS_KEY=export-worker
+      - EXPORT_STORAGE_SECRET_KEY=${EXPORT_WORKER_SECRET}
+      # The buckets a part may reference documents in (space-separated).
+      - EXPORT_DOCUMENT_BUCKETS=${STORAGE_BUCKET} ${OUTPUT_BUCKET}
+      - EXPORT_RETENTION_DAYS=${EXPORT_RETENTION_DAYS:-7}
+    volumes:
+      - ./reference:/app/reference:ro
+    networks:
+      - database
+      - nats
+      - minio
+      - opentelemetry
+    healthcheck:
+      # The loop touches this heartbeat on every tick (60 s), also while idle.
+      test: ["CMD-SHELL", "find /tmp/export-worker.alive -mmin -3 | grep -q . || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      postgres-init:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+      nats:
+        condition: service_healthy
+
   allocation-key-generation:
     profiles: ["backend"]
     image: ghcr.io/optimce/allocation-key-generation:main-prod
@@ -1024,6 +1176,14 @@ services:
       # crash-loops all nine annexe services at boot.
       - REALTIME_ENABLED=${REALTIME_ENABLED:-false}
       - REALTIME_REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/1
+      # Data export: answers the `allocation-key-generation` part with its own account, which
+      # writes exports/parts/*/allocation-key-generation/ only - never with the storage
+      # account above. Missing: the part's consumer is skipped with a
+      # "Data export disabled" warning and the API runs on.
+      - EXPORT_STORAGE_ENDPOINT=http://minio:9000
+      - EXPORT_STORAGE_REGION=us-east-1
+      - EXPORT_STORAGE_ACCESS_KEY=export-allocation-key-generation
+      - EXPORT_STORAGE_SECRET_KEY=${EXPORT_ALLOCATION_KEY_GENERATION_SECRET}
       - LOGGING_TOKEN=${LOGGING_TOKEN}
       - LOGGING_TRACES_URL=${LOGGING_TRACES_URL}
       - LOGGING_LOGS_URL=${LOGGING_LOGS_URL}
@@ -1146,6 +1306,14 @@ services:
       # crash-loops all nine annexe services at boot.
       - REALTIME_ENABLED=${REALTIME_ENABLED:-false}
       - REALTIME_REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/1
+      # Data export: answers the `simulation-key` part with its own account, which
+      # writes exports/parts/*/simulation-key/ only - never with the storage
+      # account above. Missing: the part's consumer is skipped with a
+      # "Data export disabled" warning and the API runs on.
+      - EXPORT_STORAGE_ENDPOINT=http://minio:9000
+      - EXPORT_STORAGE_REGION=us-east-1
+      - EXPORT_STORAGE_ACCESS_KEY=export-simulation-key
+      - EXPORT_STORAGE_SECRET_KEY=${EXPORT_SIMULATION_KEY_SECRET}
       - LOGGING_TOKEN=${LOGGING_TOKEN}
       - LOGGING_TRACES_URL=${LOGGING_TRACES_URL}
       - LOGGING_LOGS_URL=${LOGGING_LOGS_URL}
@@ -1257,6 +1425,17 @@ services:
       # crash-loops all nine annexe services at boot.
       - REALTIME_ENABLED=${REALTIME_ENABLED:-false}
       - REALTIME_REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/1
+      # Data export: answers the `news-board` part with its own account, which
+      # writes exports/parts/*/news-board/ only - never with the storage
+      # account above. Missing: the part's consumer is skipped with a
+      # "Data export disabled" warning and the API runs on.
+      # Its only use of NATS, connected in the background: a broker that is
+      # down never fails the boot (empty = export off).
+      - NATS_URL=nats://nats:4222
+      - EXPORT_STORAGE_ENDPOINT=http://minio:9000
+      - EXPORT_STORAGE_REGION=us-east-1
+      - EXPORT_STORAGE_ACCESS_KEY=export-news-board
+      - EXPORT_STORAGE_SECRET_KEY=${EXPORT_NEWS_BOARD_SECRET}
       - LOGGING_TOKEN=${LOGGING_TOKEN}
       - LOGGING_TRACES_URL=${LOGGING_TRACES_URL}
       - LOGGING_LOGS_URL=${LOGGING_LOGS_URL}
@@ -1266,6 +1445,9 @@ services:
       - crm
       - database
       - news-board
+      # The data export only (NATS_URL, EXPORT_STORAGE_*).
+      - nats
+      - minio
       - opentelemetry
       - redis
     depends_on:
@@ -1342,6 +1524,14 @@ services:
       # crash-loops all nine annexe services at boot.
       - REALTIME_ENABLED=${REALTIME_ENABLED:-false}
       - REALTIME_REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/1
+      # Data export: answers the `billing` part with its own account, which
+      # writes exports/parts/*/billing/ only - never with the storage
+      # account above. Missing: the part's consumer is skipped with a
+      # "Data export disabled" warning and the API runs on.
+      - EXPORT_STORAGE_ENDPOINT=http://minio:9000
+      - EXPORT_STORAGE_REGION=us-east-1
+      - EXPORT_STORAGE_ACCESS_KEY=export-billing
+      - EXPORT_STORAGE_SECRET_KEY=${EXPORT_BILLING_SECRET}
       - LOGGING_TOKEN=${LOGGING_TOKEN}
       - LOGGING_TRACES_URL=${LOGGING_TRACES_URL}
       - LOGGING_LOGS_URL=${LOGGING_LOGS_URL}
@@ -1487,6 +1677,14 @@ services:
       # and nothing is polled.
       - INBOUND_ADDRESS_TEMPLATE=${INBOUND_ADDRESS_TEMPLATE:-}
       - INBOUND_IMAP_HOST=${INBOUND_IMAP_HOST:-}
+      # Data export: answers the `administrative-document` part with its own account, which
+      # writes exports/parts/*/administrative-document/ only - never with the storage
+      # account above. Missing: the part's consumer is skipped with a
+      # "Data export disabled" warning and the API runs on.
+      - EXPORT_STORAGE_ENDPOINT=http://minio:9000
+      - EXPORT_STORAGE_REGION=us-east-1
+      - EXPORT_STORAGE_ACCESS_KEY=export-administrative-document
+      - EXPORT_STORAGE_SECRET_KEY=${EXPORT_ADMINISTRATIVE_DOCUMENT_SECRET}
       - LOGGING_TOKEN=${LOGGING_TOKEN}
       - LOGGING_TRACES_URL=${LOGGING_TRACES_URL}
       - LOGGING_LOGS_URL=${LOGGING_LOGS_URL}
@@ -1679,8 +1877,8 @@ services:
   #     every other route is unaffected.
   #
   # Offer it to managers with ANNEX_CATALOG_ENABLE=live-data (crm-backend, above)
-  # only once this profile runs. Procedure, certificate renewal and the dynsec
-  # backup: docs/runbooks/live-data.md.
+  # only once this profile runs. Certificate renewal, rotation and the dynsec
+  # backup: README, "Live data (MQTT)".
   #
   # Images: ghcr.io/optimce/live-data:main-prod (API) and :main-worker (ingest
   # worker AND scheduler — one image, two entrypoints).
@@ -1813,6 +2011,17 @@ services:
       - BROKER_PUBLIC_HOST=${LIVE_DATA_BROKER_PUBLIC_HOST:-}
       - BROKER_PUBLIC_PORT=${LIVE_DATA_BROKER_PUBLIC_PORT:-8883}
       - BROKER_PUBLIC_TLS=true
+      # Data export: answers the `live-data` part with its own account, which
+      # writes exports/parts/*/live-data/ only - never with the storage
+      # account above. Missing: the part's consumer is skipped with a
+      # "Data export disabled" warning and the API runs on.
+      # Its only use of NATS, connected in the background: a broker that is
+      # down never fails the boot (empty = export off).
+      - NATS_URL=nats://nats:4222
+      - EXPORT_STORAGE_ENDPOINT=http://minio:9000
+      - EXPORT_STORAGE_REGION=us-east-1
+      - EXPORT_STORAGE_ACCESS_KEY=export-live-data
+      - EXPORT_STORAGE_SECRET_KEY=${EXPORT_LIVE_DATA_SECRET}
       - LOGGING_TOKEN=${LOGGING_TOKEN}
       - LOGGING_TRACES_URL=${LOGGING_TRACES_URL}
       - LOGGING_LOGS_URL=${LOGGING_LOGS_URL}
@@ -1821,6 +2030,9 @@ services:
       - api-gateway
       - database
       - mqtt
+      # The data export only (NATS_URL, EXPORT_STORAGE_*).
+      - nats
+      - minio
       - opentelemetry
     depends_on:
       postgres:
@@ -1957,19 +2169,17 @@ services:
   # administrative annexe collects), sealed by the platform with pyHanko, with a
   # hash-chained evidence log and a docgen-rendered evidence report.
   #
-  # Its OWN profile and OFF by default, like live-data, for three reasons none
-  # of which is visible from inside the stack:
-  #   * the images do not exist yet: the signature repo has no GitHub
-  #     repository, so ghcr.io/optimce/signature:main-prod / :main-worker are
-  #     not published, and a `--profile signature pull` fails;
-  #   * the seal certificate is UNDECIDED (who holds it, which type, PKCS#12 or
-  #     HSM/cloud key): the worker loads it on the first seal, so without one
-  #     every request fails at completion and lands in the DLQ;
-  #   * ENV=production refuses to boot BOTH containers without TSA_URLS (one
-  #     shared settings check), and the timestamp authority is not chosen yet
-  #     either (a qualified TSA on an EU trusted list).
+  # Its OWN profile and OFF by default, like live-data, because a host needs
+  # two things none of which is visible from inside the stack:
+  #   * a seal certificate (PKCS#12 in ./signature-seal/): the worker loads it
+  #     on the first seal, so without one every request fails at completion
+  #     and lands in the DLQ;
+  #   * a timestamp authority: ENV=production refuses to boot BOTH containers
+  #     without TSA_URLS (one shared settings check).
+  # docker-stack.sh starts the profile, after the frontend and non-fatally,
+  # when SIGNATURE_ENABLED=true in .env (start_signature).
   #
-  # Turning it on (docs/runbooks/espace-administratif-signature.md):
+  # Turning it on:
   #   SIGNATURE_DB_PASSWORD, SIGNATURE_TSA_URLS, the seal files in
   #   ./signature-seal/ and SIGNATURE_SEAL_* in .env; SIGNATURE_ENABLED=true so
   #   the init profile downloads the real spec (signature-doc-gen); re-run init
@@ -2037,6 +2247,14 @@ services:
       # Realtime (SSE hints) - fire-and-forget; see the note on news-board.
       - REALTIME_ENABLED=${REALTIME_ENABLED:-false}
       - REALTIME_REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/1
+      # Data export: answers the `signature` part with its own account, which
+      # writes exports/parts/*/signature/ only - never with the storage
+      # account above. Missing: the part's consumer is skipped with a
+      # "Data export disabled" warning and the API runs on.
+      - EXPORT_STORAGE_ENDPOINT=http://minio:9000
+      - EXPORT_STORAGE_REGION=us-east-1
+      - EXPORT_STORAGE_ACCESS_KEY=export-signature
+      - EXPORT_STORAGE_SECRET_KEY=${EXPORT_SIGNATURE_SECRET}
       - LOGGING_TOKEN=${LOGGING_TOKEN}
       - LOGGING_TRACES_URL=${LOGGING_TRACES_URL}
       - LOGGING_LOGS_URL=${LOGGING_LOGS_URL}
@@ -2355,7 +2573,7 @@ services:
   # has it — and losing it means re-enrolling the whole fleet by hand, on devices
   # with no keyboard (plan §15.3). A plain copy is consistent: the dynsec plugin
   # rewrites the file whole on every mutating command. Read-only mount; the
-  # broker may keep running. Restore: docs/runbooks/live-data.md.
+  # broker may keep running. Restore: README, "Live data (MQTT)".
   mosquitto-backup:
     profiles: ["backup"]
     image: eclipse-mosquitto:2.1.2-alpine@sha256:6f8d8a947c506f8a2290ec65cd4bd2bc7cb4d43fb5f6271f861cb013e2ef9797

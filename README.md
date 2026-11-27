@@ -58,6 +58,8 @@ them into their final form (`prod-config.json`, `config.json`,
 |---------|---------|--------|
 | crm-frontend | Angular UI | http://localhost |
 | crm-backend | Node.js API | http://localhost/api |
+| crm-outbox-relay | crm-backend's image, its own process: publishes `crm_db.outbox_event` to NATS `core.evt.*` | internal |
+| crm-export-worker | crm-backend's image, its own process: assembles the data exports (RGPD) into the `exports` bucket | internal |
 | postgres | PostgreSQL — all five application databases | internal |
 | postgres-init | One-shot provisioning of roles, databases and grants | internal |
 | allocation-key-generation | Allocation-key generation API + worker | http://localhost/api/generation |
@@ -75,6 +77,7 @@ them into their final form (`prod-config.json`, `config.json`,
 | redis | Realtime (SSE) ticket store and pub/sub bus | internal |
 | best-address | Self-hosted BeSt Address register (FPS BOSA) — the address picker. ~1.7 GB RAM | internal |
 | dso-lookup | Which network operator (GRD) serves an address — prefills the meter form; called by crm-backend only | internal |
+| signature | In-app electronic signature API + seal worker (`signature` profile, started when `SIGNATURE_ENABLED=true`) | http://localhost/api/signature |
 | live-data | Live Data annexe API + ingest worker + scheduler (`live-data` profile) | http://localhost/api/live, device enrolment at /api/live-public/enroll |
 | mosquitto | MQTT broker for the live-data devices — TLS terminates here (`live-data` profile) | mqtts://${LIVE_DATA_BROKER_PUBLIC_HOST}:8883 |
 | reverse-proxy | NGINX reverse proxy | http://localhost |
@@ -85,7 +88,8 @@ them into their final form (`prod-config.json`, `config.json`,
 ./docker-stack.sh start           # Full stack
 ./docker-stack.sh start --no-pull # Skip image pulls
 ./docker-stack.sh stop            # Stop all (triggers automatic backup)
-./docker-stack.sh restart         # Restart (triggers automatic backup)
+./docker-stack.sh restart         # Pull, stop, start (triggers automatic backup)
+./docker-stack.sh pull            # Pull every image, the migrator's included; stops nothing
 ./docker-stack.sh migrate         # Apply pending migrations, then re-converge grants
 ./docker-stack.sh migrate --dry-run  # Report what is pending, change nothing
 ./docker-stack.sh verify          # Prove database isolation and the CRM grants
@@ -109,16 +113,18 @@ Docker Compose profiles control which services start:
 
 | Profile | Services | Purpose |
 |---------|----------|---------|
-| `init` | swagger-doc-gen, generation-doc-gen, simulation-doc-gen, news-board-doc-gen, billing-doc-gen, administrative-document-doc-gen, live-data-doc-gen, krakend-config, keycloak-config, nginx-config, crm-frontend-config, keycloak-group-id-mapper, keycloak-optimce-theme | One-shot config generators and provider downloads |
-| `backend` | postgres, postgres-init, keycloak-db, keycloak, keycloak-healthcheck, crm-backend, allocation-key-generation (+ worker), simulation-key (+ worker), news-board, billing (+ worker), administrative-document (+ worker), document-generation, notification-dispatch, nats, redis, best-address, dso-lookup, minio, minio-init, krakend | Core infrastructure |
+| `init` | swagger-doc-gen, generation-doc-gen, simulation-doc-gen, news-board-doc-gen, billing-doc-gen, administrative-document-doc-gen, live-data-doc-gen, signature-doc-gen, krakend-config, keycloak-config, nginx-config, crm-frontend-config, keycloak-group-id-mapper, keycloak-optimce-theme | One-shot config generators and provider downloads |
+| `backend` | postgres, postgres-init, keycloak-db, keycloak, keycloak-healthcheck, crm-backend, crm-outbox-relay, crm-export-worker, allocation-key-generation (+ worker), simulation-key (+ worker), news-board, billing (+ worker), administrative-document (+ worker), document-generation, notification-dispatch, nats, redis, best-address, dso-lookup, minio, minio-init, krakend | Core infrastructure |
 | `frontend` | reverse-proxy, certbot, crm-frontend | Web serving layer |
+| `signature` | signature, signature-worker | The signature annexe (needs a seal and a TSA) — always combined with `backend` |
 | `live-data` | mosquitto-certs, mosquitto-init, mosquitto, mosquitto-roles, live-data, live-data-worker, live-data-scheduler | The Live Data annexe and its MQTT broker — always combined with `backend` |
 | `migration` | optimce-migrator | One-shot schema migrations, all six databases |
 | `backup` | db-backup, keycloak-db-backup, mosquitto-backup | Database dumps and the broker's device credentials |
 | `certs` | certbot-mqtt | The broker certificate's first issuance (`./docker-stack.sh mqtt-cert`) |
 
-Default startup runs `init`, then `backend`, then `frontend`, then `live-data` — the last one
-**non-fatally**: a live-data failure is reported and leaves the rest of the platform running.
+Default startup runs `init`, then `backend`, then `frontend`, then `signature` (only with
+`SIGNATURE_ENABLED=true` in `.env`) and `live-data` — those last two **non-fatally**: a
+failure is reported and leaves the rest of the platform running.
 The `live-data` profile must always be combined with `backend` (its services gate on
 `postgres-init`), and nothing outside it may depend on it.
 
@@ -228,13 +234,17 @@ operators listed in `GEOCODING_BACKFILL_OPERATORS` may run.
 The **address picker** is a third source and a different shape: `best-address` is the
 federal BeSt Address register run here as our own container, so it is the one address
 lookup allowed on the inline write path — which is what upgrades a new meter's pin from
-the commune centre to its actual roof. Two things to know before the first deploy:
+the commune centre to its actual roof. Three things to know before the first deploy:
 
 - **It costs ~1.7 GB resident.** The address file is baked into the image, so the image
   reference *is* the dataset version (`YYYY-WW`, the ISO week of the extract) and a
   `docker pull` is the data refresh. `.github/renovate.json` carries the versioning rule
   that keeps that refresh arriving; without it Renovate misreads the tag and the register
   freezes at whatever week was pinned.
+- **The pin expires.** The publisher keeps only the last ten weekly tags on Docker Hub,
+  digests included. A host that holds the image keeps working; a new host, or one that
+  pruned it, fails the whole pull. Move the pin at least every ten weeks, and check the
+  disk first (about 6 GB unpacked).
 - **Blanking `BEST_ADDRESS_URL` is the off switch — deleting the line is not.** Blank,
   the suggester is unbound and `GET /geocoding/suggest` answers `[]` rather than
   erroring. That silence is also how a broken deployment hides, so check
@@ -268,7 +278,103 @@ started **last and non-fatally**: whatever goes wrong there, the rest of the pla
 - **Show it to managers last**: `ANNEX_CATALOG_ENABLE=live-data`, then
   `docker compose --profile backend up -d crm-backend`, once the profile is healthy.
 
-Procedure, troubleshooting, rotation and restore: [`docs/runbooks/live-data.md`](docs/runbooks/live-data.md).
+Rotating its credentials, and restoring the broker (`DC` is
+`docker compose -f docker-compose/docker-compose.yml --env-file docker-compose/.env --profile backend --profile live-data`):
+
+- `LIVE_DATA_DB_PASSWORD`: edit `.env`, then `./docker-stack.sh restart`.
+- `MQTT_INGEST_PASSWORD`: edit `.env`, then `$DC up -d` (re-asserted on every start).
+- `MOSQUITTO_DYNSEC_PASSWORD` is stored in the broker **once**, at its first start: change
+  it there first, then in `.env`, then `$DC up -d`.
+
+  ```bash
+  $DC exec mosquitto mosquitto_ctrl -h localhost -p 1883 -u optimce-admin -P 'OLD' \
+    dynsec setClientPassword optimce-admin 'NEW'
+  ```
+
+- The devices' credentials, from a `mosquitto_dynsec_*.json` backup:
+
+  ```bash
+  $DC stop mosquitto
+  $DC run --rm --no-deps --user 0 -v "$PWD/docker-compose/backups:/b:ro" --entrypoint sh mosquitto-init \
+    -c 'cp /b/mosquitto_dynsec_YYYYMMDD_HHMMSS.json /mosquitto/data/dynamic-security.json && chown 1883:1883 /mosquitto/data/dynamic-security.json'
+  $DC up -d
+  ```
+
+## Data export
+
+« Exporter mes données » (any user) and the community export (its admins): a ZIP that
+`crm-export-worker` assembles from one part per service, kept `EXPORT_RETENTION_DAYS` in
+the MinIO bucket `exports` and downloaded through a short-lived signed link.
+
+**The keys.** The ten `EXPORT_*_SECRET` and `EXPORT_SERVICES` are required: while one is
+missing, compose refuses **every** command, `stop` and the backups included, and names it.
+`.env.example` documents each one. This adds the secrets that are missing and keeps the
+others; it also guards a last line without a newline, which a bare `echo >>` would glue to
+the new one:
+
+```bash
+cd docker-compose
+cp .env ".env.before-export-$(date +%Y%m%d%H%M)"
+[ -n "$(tail -c1 .env)" ] && echo >> .env
+for k in EXPORT_CRM_SECRET EXPORT_SIGNATURE_SECRET EXPORT_ADMINISTRATIVE_DOCUMENT_SECRET \
+         EXPORT_BILLING_SECRET EXPORT_NEWS_BOARD_SECRET EXPORT_SIMULATION_KEY_SECRET \
+         EXPORT_ALLOCATION_KEY_GENERATION_SECRET EXPORT_LIVE_DATA_SECRET \
+         EXPORT_WORKER_SECRET EXPORT_DOWNLOAD_SECRET; do
+  grep -q "^$k=" .env || printf '%s=%s\n' "$k" "$(openssl rand -hex 32)" >> .env
+done
+```
+
+Then, with an editor, `EXPORT_SERVICES`: exactly the services that run here. One that is
+listed but never answers fails every export after 3 × 30 minutes; one that runs but is not
+listed is silently missing from every archive.
+
+**The download host.** `MINIO_PUBLIC_ENDPOINT` must be `https://s3.<domain>`: the links are
+signed for it, and a browser blocks an http download started from the https app. The web
+certificate must cover that name (`certbot certificates`); to add it:
+
+```bash
+docker compose -f docker-compose/docker-compose.yml --env-file docker-compose/.env --profile frontend \
+  run --rm certbot certonly --webroot -w /webroot --cert-name <domain> --expand \
+  -d <domain> -d s3.<domain> --agree-tos -m <email> --non-interactive
+```
+
+**The step-up.** An export needs a recent browser login, read from the token's `auth_time`.
+A realm that existed before the signature annexe does not have that mapper (the import
+skips an existing realm): *Client scopes → basic → Mappers → User Session Note*, note
+`AUTH_TIME`, claim `auth_time`, type `long`, added to the access token. Without it every
+request answers 401 35000.
+
+**Deploying it.** crm-backend's image maps the new columns, so on an older schema every read
+of a community fails: migrate before it starts, and run neither `start` nor `restart`
+between its publication and the migration.
+
+```bash
+git pull                                  # then the keys above
+docker compose -f docker-compose/docker-compose.yml --env-file docker-compose/.env \
+  --profile init --profile backend --profile frontend --profile live-data --profile signature config -q
+./docker-stack.sh pull                    # nothing is stopped if an image is missing
+./docker-stack.sh stop
+docker compose -f docker-compose/docker-compose.yml --env-file docker-compose/.env \
+  --profile backend up -d postgres postgres-init
+./docker-stack.sh migrate --no-pull --dry-run   # crm 21 and 22, nothing else
+./docker-stack.sh migrate --no-pull
+./docker-stack.sh start --no-pull
+```
+
+**Checking it.** `minio-init` does not hold the platform back when the export's storage
+cannot be provisioned, so look:
+
+- `docker compose … --profile backend logs minio-init | grep provision-exports`: ten
+  `account export-… ready` lines, no `ERROR`;
+- `crm-export-worker` is healthy;
+- `grep -c '"endpoint": "/exports' docker-compose/krakend_config/krakend.json` and
+  `grep -c x-auth-time` on the same file are not 0 (a 0: crm-backend's OpenAPI page was not
+  republished yet; re-run the init profile and restart krakend once it is);
+- one export of your own, to the end: `manifest.json` in the ZIP lists every service of
+  `EXPORT_SERVICES` as done.
+
+**Going back.** Migrations 21 and 22 only add two tables and two nullable columns: the
+previous crm-backend image runs on them unchanged.
 
 ## Automatic Backups
 
@@ -284,6 +390,7 @@ application database plus the cluster-wide role definitions in one job;
 - Billing → `backups/billing_YYYYMMDD_HHMMSS.sql`
 - Administrative-document → `backups/administrative_document_YYYYMMDD_HHMMSS.sql`
 - Live-data → `backups/live_data_YYYYMMDD_HHMMSS.sql`
+- Signature → `backups/signature_YYYYMMDD_HHMMSS.sql`
 - Keycloak → `backups/keycloak_YYYYMMDD_HHMMSS.sql`
 - The MQTT broker's device credentials → `backups/mosquitto_dynsec_YYYYMMDD_HHMMSS.json`
   (`mosquitto-backup`). Not in any database, and losing it means re-enrolling every
@@ -319,7 +426,7 @@ exposing the stack to a network.
 
 ### Vendored configuration
 
-Three directories hold config copied from the application repos. They are **not** baked into the
+These paths hold config copied from the application repos. They are **not** baked into the
 published images, so they must be kept in sync when the corresponding service changes:
 
 | Path | Source | Consumed by |
@@ -330,6 +437,7 @@ published images, so they must be kept in sync when the corresponding service ch
 | `docker-compose/document-templates/billing/` | `billing/document-templates/billing/` | seeded into the `optimce-templates` bucket by `minio-init` |
 | `docker-compose/document-templates/administrative-document/` | `administrative-document/document-templates/administrative-document/` | seeded into the same bucket by `minio-init` |
 | `docker-compose/schemas/live_data_local.sql` | `live-data/scripts/sql/schema.sql` | `postgres-init`, applied only to an **empty** `live_data_local` — it embodies `schema_version` 4, which the live-data image's readiness check compares against |
+| `docker-compose/minio/export/` | monorepo `minio/export/` (byte-identical, LF) | `minio-init`: the data export's `exports` bucket, lifecycle and MinIO accounts (`provision.sh`, bash) |
 | `docker-compose/mosquitto/mosquitto.conf` | monorepo `mosquitto/config/mosquitto.conf`, **except the listeners** (production adds the TLS one through `include_dir`) | `mosquitto` |
 
 The files under `docker-compose/schemas/` are disaster-recovery baselines, not

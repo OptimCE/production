@@ -11,15 +11,20 @@ MIGRATE_DRY_RUN=false
 # compose rejects a depends_on target outside the enabled profiles, so every
 # command that names the live-data profile enables both.
 LIVE_DATA_PROFILES=(--profile backend --profile live-data)
+# Same for signature: its services gate on postgres, postgres-init, nats,
+# minio-init and document-generation, all in `backend`.
+SIGNATURE_PROFILES=(--profile backend --profile signature)
 
 usage() {
     cat <<'EOF'
 Usage: ./docker-stack.sh <command> [options]
 
 Commands:
-    start       Pull images (optional) and start init, backend, frontend, then live-data
+    start       Pull images (optional) and start init, backend, frontend, then
+                signature (SIGNATURE_ENABLED=true) and live-data
     stop        Stop every profile (backups first)
-    restart     Stop then start
+    restart     Pull images (optional), then stop, then start
+    pull        Pull every image, the migrator's included; stops nothing
     migrate     Apply pending database migrations, then re-converge the grants
     verify      Prove the database isolation and the CRM grant matrix
     survey-ean  Report every stored EAN that is not 18 digits (read-only)
@@ -67,19 +72,53 @@ compose() {
     "${DOCKER_COMPOSE_CMD[@]}" "$@"
 }
 
+pull_images() {
+    # One image that cannot be pulled (withdrawn by its publisher, a GHCR package
+    # still private) makes compose interrupt the whole pull and fail. Hence the
+    # order in `restart` and the `pull` command: pull FIRST, while the platform
+    # still runs, so that failure costs nothing.
+    compose -f "$COMPOSE_FILE" --profile init --profile backend --profile frontend pull
+    # Separately and non-fatally: a live-data image that cannot be pulled
+    # (e.g. its GHCR package still private) must not abort the deploy of
+    # everything else. start_live_data reports what that means.
+    if live_data_enabled; then
+        compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "${LIVE_DATA_PROFILES[@]}" \
+            pull mosquitto live-data live-data-worker \
+            || echo "WARNING: could not pull the live-data images. Continuing."
+    fi
+    if signature_enabled; then
+        compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "${SIGNATURE_PROFILES[@]}" \
+            pull signature signature-worker \
+            || echo "WARNING: could not pull the signature images. Continuing."
+    fi
+}
+
+pull_all() {
+    # Before a release that needs `stop` -> `migrate` -> `start --no-pull`: every
+    # image is on the host before anything goes down, the migrator's included.
+    check_docker_service
+    pull_images
+    compose -f "$COMPOSE_FILE" --profile backend --profile migration pull optimce-migrator
+    echo "Every image is on this host. Nothing was stopped or started."
+}
+
+restart_stack() {
+    # Pull BEFORE stop. The other way round, an image that cannot be pulled is
+    # discovered with the platform already down.
+    if [ "$PULL_IMAGES" = true ]; then
+        check_docker_service
+        pull_images
+        PULL_IMAGES=false
+    fi
+    stop_stack
+    start_stack
+}
+
 start_stack() {
     check_docker_service
 
     if [ "$PULL_IMAGES" = true ]; then
-        compose -f "$COMPOSE_FILE" --profile init --profile backend --profile frontend pull
-        # Separately and non-fatally: a live-data image that cannot be pulled
-        # (e.g. its GHCR package still private) must not abort the deploy of
-        # everything else. start_live_data reports what that means.
-        if live_data_enabled; then
-            compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "${LIVE_DATA_PROFILES[@]}" \
-                pull mosquitto live-data live-data-worker \
-                || echo "WARNING: could not pull the live-data images (see docs/runbooks/live-data.md). Continuing."
-        fi
+        pull_images
     fi
 
     compose -f "$COMPOSE_FILE" --profile init --env-file "$ENV_FILE" up -d
@@ -95,7 +134,35 @@ start_stack() {
     check_frontend_config
     compose -f "$COMPOSE_FILE" --profile frontend --env-file "$ENV_FILE" up -d
 
+    start_signature
     start_live_data
+}
+
+start_signature() {
+    # Only with SIGNATURE_ENABLED=true in .env: the same switch that gives the
+    # gateway its /signature routes (signature-doc-gen, init profile), so the
+    # routes and the containers come and go together. Off on a fresh host: it
+    # needs a seal and a TSA, and ENV=production refuses to boot without
+    # TSA_URLS (the signature block of docker-compose/.env.example).
+    #
+    # Until this function existed `stop` brought signature down and `start`
+    # never brought it back: a `restart` silently ended in-app signing, and
+    # failed every data export once crm-backend's EXPORT_SERVICES lists it.
+    #
+    # After the frontend and NON-FATAL, like live-data: nothing else depends on
+    # it (administrative-document binds signature.event.* in the background), so
+    # a failure here is reported and the site stays up.
+    if ! signature_enabled; then
+        echo "signature: off (SIGNATURE_ENABLED is not true in ${ENV_FILE}) - not started."
+        return 0
+    fi
+    echo "Starting signature (a failure here leaves the rest of the platform running)..."
+    if ! compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "${SIGNATURE_PROFILES[@]}" up -d; then
+        echo
+        echo "WARNING: the signature profile did not start cleanly. Everything else is up."
+        echo "  Inspect: ${DOCKER_COMPOSE_CMD[*]} -f ${COMPOSE_FILE} --env-file ${ENV_FILE} --profile backend --profile signature ps -a"
+        echo "  Seal, TSA and step-up: the signature block of docker-compose/.env.example"
+    fi
 }
 
 start_live_data() {
@@ -118,7 +185,7 @@ start_live_data() {
         echo
         echo "WARNING: the live-data profile did not start cleanly. Everything else is up."
         echo "  Inspect: ${DOCKER_COMPOSE_CMD[*]} -f ${COMPOSE_FILE} --env-file ${ENV_FILE} --profile backend --profile live-data ps -a"
-        echo "  Usual causes and fixes: docs/runbooks/live-data.md"
+        echo "  Usual causes: the live-data section of README.md"
     fi
 }
 
@@ -158,7 +225,8 @@ stop_stack() {
     do_backup
     # live-data and signature included: left out, their containers keep running
     # and `down` then fails to remove the networks they are still attached to.
-    # (signature is never started by this script; it may have been by hand.)
+    # (signature is started by this script only with SIGNATURE_ENABLED=true;
+    # it may also have been by hand.)
     compose -f "$COMPOSE_FILE" --profile init --profile backend --profile frontend --profile live-data --profile signature down
 }
 
@@ -239,6 +307,16 @@ live_data_enabled() {
     local v
     v=$({ grep -E '^LIVE_DATA_ENABLED=' "$ENV_FILE" || true; } | tail -n 1 | cut -d= -f2- | tr -d "\"' \r")
     [ "$v" != "false" ]
+}
+
+signature_enabled() {
+    # SIGNATURE_ENABLED=true in .env, and only exactly that - the opposite
+    # default to live-data's, and the very test signature-doc-gen applies
+    # (`= "true"`), so the containers run exactly when the gateway has their
+    # routes. Quotes and CR stripped as in live_data_enabled.
+    local v
+    v=$({ grep -E '^SIGNATURE_ENABLED=' "$ENV_FILE" || true; } | tail -n 1 | cut -d= -f2- | tr -d "\"' \r")
+    [ "$v" = "true" ]
 }
 
 broker_host() {
@@ -445,8 +523,10 @@ main() {
             ;;
         restart)
             parse_start_options "$@"
-            stop_stack
-            start_stack
+            restart_stack
+            ;;
+        pull)
+            pull_all
             ;;
         migrate)
             parse_migrate_options "$@"

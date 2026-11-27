@@ -8,9 +8,64 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Added (the data export, RGPD art. 15 and 20; the public directory contact)
+
+Deploy order, the `.env` keys and the checks: README, "Data export".
+Fill the `.env` FIRST: compose now refuses every command while one of the new
+required keys is missing. The migrator (crm v22) runs BEFORE the new crm-backend
+image starts: its `community` entity maps the two new columns, so on crm v20 every
+read of a community fails.
+
+- **`crm-export-worker`** (backend profile): crm-backend's image, its own process
+  (`node dist/src/export-worker.js`). Starts each export, asks every service listed
+  in `EXPORT_SERVICES` for its part over NATS (stream EXPORTS), assembles the ZIP
+  into the MinIO bucket `exports`, notifies the requester, expires the archives.
+- **`minio-init`** runs `minio/export/provision.sh` (vendored from the monorepo):
+  the `exports` bucket and its lifecycle (`parts/` 2 days, `archives/` 8), one
+  account per producing service, `export-worker` and `export-download`. Its ten
+  `EXPORT_*_SECRET` are `:?`-required. A provisioning failure is reported in its log
+  and does not hold the platform back.
+- **crm-backend**: `NATS_URL` and the `nats` network, `EXPORT_STORAGE_*`
+  (export-crm), the download signer `EXPORT_DOWNLOAD_*` (for
+  `MINIO_PUBLIC_ENDPOINT`, which must be https), the required `EXPORT_SERVICES`
+  and the pinned ceilings `EXPORT_RETENTION_DAYS`, `EXPORT_MAX_REQUESTS_PER_DAY`,
+  `EXPORT_STEP_UP_MAX_AGE_SECONDS`, `EXPORT_DOWNLOAD_URL_TTL_SECONDS`.
+- **`EXPORT_STORAGE_*`** with their own account on allocation-key-generation,
+  simulation-key, news-board, billing, administrative-document, signature and
+  live-data; `NATS_URL` and the `nats` + `minio` networks on news-board and
+  live-data (their only use of NATS, connected in the background).
+- **`schemas/crm_db.sql`** re-vendored from crm-backend's `init.sql`: it had stayed
+  at the 10-25 level (no outbox, no regulatory link status, no representative
+  columns) and now also carries `export_job`/`export_part` and
+  `community.contact_email`/`contact_phone`.
+- **`nats`** reads `nats/nats.conf`: `max_payload` goes from 1 to 8 MiB. One
+  `export.part.done` carries the whole file list of a part, which passes 1 MiB near
+  4,000 files.
+- **`schemas/administrative_document_local.sql`** re-vendored from the annexe's
+  `schema.sql` (it had stayed at the August level; fresh installs only).
+- `max_connections` stays 350: 330 used with the worker's pool.
+
+### Changed (images are pulled before anything stops)
+
+- **`docker-stack.sh restart`** (and `.bat`) pulls, then stops, then starts: an image
+  that cannot be pulled no longer leaves the platform down. **`docker-stack.sh pull`**
+  pulls every image, the migrator's included, and stops nothing: for the releases that
+  need `stop`, `migrate`, `start --no-pull`.
+- **`best-address` 2026-35 → 2026-47.** The publisher keeps ten weekly tags and had
+  withdrawn the pinned one: a host without a local copy could no longer pull it, and
+  with it nothing else. `.github/renovate.json` gives that image its own branch. The
+  new image is about 6 GB unpacked: check the disk before pulling.
+- README and CHANGELOG no longer point at documents that are not in this repository.
+
+### Changed (the signature profile starts with the stack)
+
+- `docker-stack.sh` (and `.bat`) starts the `signature` profile, after the frontend
+  and non-fatally like live-data, when `SIGNATURE_ENABLED=true` in `.env`; `start`
+  pulls its images in that case. Before, `stop` brought it down and `start` never
+  brought it back.
+
 ### Added (espace administratif and the signature annexe)
 
-Deploy order and the hand steps: `docs/runbooks/espace-administratif-signature.md`.
 The migrator (crm v20, administrative-document v6) runs BEFORE the new annexe images
 start, document-generation's image goes out no later than the annexe's, and
 `postgres-init` runs again after the migrator (`./docker-stack.sh migrate` does both).
@@ -45,7 +100,7 @@ start, document-generation's image goes out no later than the annexe's, and
     templates.
   - The realm template's `basic` scope gained the `auth_time` mapper and `acr` its
     `acr loa level` mapper. `--import-realm` skips an existing realm: patch the live
-    one by hand (runbook §2).
+    one by hand (README, "Data export").
 - `key_description/v1` vendored into `document-templates/administrative-document/`.
 - **`max_connections` 300 → 350** (320 counted, the signature profile included):
   recreates `postgres` on the next `up`.
@@ -233,8 +288,7 @@ start, document-generation's image goes out no later than the annexe's, and
   new crm-backend needs, and it already rejects a non-18-digit EAN on `POST /meters`.
   Online-safe (one scan of `meter` under a 5-second `lock_timeout`). Never get past it
   with `NOT VALID`: the offending meters would become read-only, and nothing can
-  rewrite a meter's EAN. See `DEPLOYMENT_PLAN.md` Step 7 and
-  `DATABASE_CONSOLIDATION.md` §9.13.
+  rewrite a meter's EAN. `./docker-stack.sh survey-ean` lists them.
 - **Billing migration 3 — an invoice corrected by a credit note becomes CREDITED.**
   The billing image of this release moves the invoice a credit note corrects to the
   new terminal status `CREDITED` (7) when the credit note is issued: not payable,
@@ -339,9 +393,6 @@ start, document-generation's image goes out no later than the annexe's, and
   (`annexes_services:catalog_overrides`); the set actually served is logged once at
   boot as `annexes_services:catalog_loaded`. README's "Adding a new annex service"
   gains the matching step.
-- `DATABASE_CONSOLIDATION.md` checks the served catalogue through that log line
-  instead of grepping `config/annexes-services.json`, which now also lists entries
-  that are switched off.
 
 ### Added (Live Data - MQTT telemetry)
 
@@ -386,7 +437,6 @@ start, document-generation's image goes out no later than the annexe's, and
 - **Backups**: `live_data_local` in `db-backup`, and `mosquitto-backup` copies the
   broker's `dynamic-security.json` — every device's credential, in no database.
 - `max_connections` arithmetic on `postgres` updated: 270 of 300.
-- `docs/runbooks/live-data.md`.
 
 ### Fixed
 
