@@ -12,7 +12,7 @@
 # THE ADMIN PASSWORD IS SET HERE, ONCE. Changing MOSQUITTO_DYNSEC_PASSWORD in .env
 # afterwards does NOT change it in this file, and live-data (which authenticates
 # with the .env value) then fails every dynsec command. To rotate it, see
-# docs/runbooks/live-data.md.
+# README, "Live data (MQTT)".
 #
 # Invoked as `sh <file>` (exec bit on a bind mount is the host's, not git's).
 # ===========================================================================

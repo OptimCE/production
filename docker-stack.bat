@@ -42,8 +42,11 @@ if /i "%COMMAND%"=="stop" (
 if /i "%COMMAND%"=="restart" (
     call :parse_start_options !REST!
     if errorlevel 1 exit /b 1
-    call :stop_stack
-    call :start_stack
+    call :restart_stack
+    exit /b !errorlevel!
+)
+if /i "%COMMAND%"=="pull" (
+    call :pull_all
     exit /b !errorlevel!
 )
 if /i "%COMMAND%"=="migrate" (
@@ -79,9 +82,11 @@ goto :usage
 echo Usage: docker-stack.bat ^<command^> [options]
 echo.
 echo Commands:
-echo   start       Pull images (optional) and start init, backend, frontend, then live-data
+echo   start       Pull images (optional) and start init, backend, frontend, then
+echo               signature (SIGNATURE_ENABLED=true) and live-data
 echo   stop        Stop every profile (backups first)
-echo   restart     Stop then start
+echo   restart     Pull images (optional), then stop, then start
+echo   pull        Pull every image, the migrator's included; stops nothing
 echo   migrate     Apply pending database migrations, then re-converge the grants
 echo   verify      Prove the database isolation and the CRM grant matrix
 echo   survey-ean  Report every stored EAN that is not 18 digits (read-only)
@@ -127,19 +132,53 @@ if errorlevel 1 (
 echo Docker service is active.
 exit /b 0
 
+:pull_images
+rem Fatal for the platform's own images; live-data and signature separately and
+rem non-fatally - see pull_images in docker-stack.sh.
+%DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --profile init --profile backend --profile frontend pull
+if errorlevel 1 exit /b 1
+findstr /r /c:"^LIVE_DATA_ENABLED=false" "%ENV_FILE%" >nul 2>&1
+if errorlevel 1 (
+    %DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" --profile backend --profile live-data pull mosquitto live-data live-data-worker
+    if errorlevel 1 echo WARNING: could not pull the live-data images. Continuing.
+)
+findstr /r /c:"^SIGNATURE_ENABLED=true" "%ENV_FILE%" >nul 2>&1
+if not errorlevel 1 (
+    %DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" --profile backend --profile signature pull signature signature-worker
+    if errorlevel 1 echo WARNING: could not pull the signature images. Continuing.
+)
+exit /b 0
+
+:pull_all
+call :check_docker_service
+if errorlevel 1 exit /b 1
+call :pull_images
+if errorlevel 1 exit /b 1
+%DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --profile backend --profile migration pull optimce-migrator
+if errorlevel 1 exit /b 1
+echo Every image is on this host. Nothing was stopped or started.
+exit /b 0
+
+:restart_stack
+rem Pull BEFORE stop - see restart_stack in docker-stack.sh.
+if "%PULL_IMAGES%"=="true" (
+    call :check_docker_service
+    if errorlevel 1 exit /b 1
+    call :pull_images
+    if errorlevel 1 exit /b 1
+    set "PULL_IMAGES=false"
+)
+call :stop_stack
+call :start_stack
+exit /b %errorlevel%
+
 :start_stack
 call :check_docker_service
 if errorlevel 1 exit /b 1
 
 if "%PULL_IMAGES%"=="true" (
-    %DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --profile init --profile backend --profile frontend pull
+    call :pull_images
     if errorlevel 1 exit /b 1
-    rem Separately and non-fatally - see start_stack in docker-stack.sh.
-    findstr /r /c:"^LIVE_DATA_ENABLED=false" "%ENV_FILE%" >nul 2>&1
-    if errorlevel 1 (
-        %DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" --profile backend --profile live-data pull mosquitto live-data live-data-worker
-        if errorlevel 1 echo WARNING: could not pull the live-data images ^(see docs\runbooks\live-data.md^). Continuing.
-    )
 )
 
 %DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --profile init --env-file "%ENV_FILE%" up -d
@@ -160,7 +199,26 @@ if errorlevel 1 exit /b 1
 %DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --profile frontend --env-file "%ENV_FILE%" up -d
 if errorlevel 1 exit /b 1
 
+call :start_signature
 call :start_live_data
+exit /b 0
+
+:start_signature
+rem Only with SIGNATURE_ENABLED=true, and NON-FATAL - see start_signature in
+rem docker-stack.sh. Without it a restart left in-app signing (and every data
+rem export that lists signature) down.
+findstr /r /c:"^SIGNATURE_ENABLED=true" "%ENV_FILE%" >nul 2>&1
+if errorlevel 1 (
+    echo signature: off ^(SIGNATURE_ENABLED is not true in %ENV_FILE%^) - not started.
+    exit /b 0
+)
+echo Starting signature (a failure here leaves the rest of the platform running)...
+%DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --env-file "%ENV_FILE%" --profile backend --profile signature up -d
+if errorlevel 1 (
+    echo.
+    echo WARNING: the signature profile did not start cleanly. Everything else is up.
+    echo   Seal, TSA and step-up: the signature block of docker-compose\.env.example
+)
 exit /b 0
 
 :start_live_data
@@ -176,7 +234,7 @@ echo Starting live-data (a failure here leaves the rest of the platform running)
 if errorlevel 1 (
     echo.
     echo WARNING: the live-data profile did not start cleanly. Everything else is up.
-    echo   Usual causes and fixes: docs\runbooks\live-data.md
+    echo   Usual causes: the live-data section of README.md
 )
 exit /b 0
 
@@ -215,8 +273,9 @@ exit /b 0
 echo Running backups before stopping...
 call :do_backup
 rem live-data and signature included: left out, their containers keep running and
-rem `down` fails to remove the networks they are attached to. (signature is never
-rem started by this script; it may have been started by hand.)
+rem `down` fails to remove the networks they are attached to. (signature is
+rem started by this script only with SIGNATURE_ENABLED=true; it may also have
+rem been started by hand.)
 %DOCKER_COMPOSE_CMD% -f "%COMPOSE_FILE%" --profile init --profile backend --profile frontend --profile live-data --profile signature down
 exit /b %errorlevel%
 

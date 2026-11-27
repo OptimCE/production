@@ -15,3 +15,12 @@ docker-stack.sh                   text eol=lf
 # stray \r ends up INSIDE values (a listener address, a file path) and the broker
 # fails on a name that looks correct in every editor.
 docker-compose/mosquitto/*        text eol=lf
+
+# The data export's MinIO provisioning (a vendored copy of the monorepo's
+# minio/export/), run by bash inside the mc container (minio-init). A CRLF
+# provision.sh dies on its first line; a CRLF policy template carries \r into
+# the JSON MinIO is given.
+docker-compose/minio/**           text eol=lf
+
+# Mounted into the NATS container.
+docker-compose/nats/**            text eol=lf

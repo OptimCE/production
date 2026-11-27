@@ -8,6 +8,12 @@
       "versioning": "regex:^(?<major>[0-9]{4})-(?<minor>[0-9]{1,2})$"
     },
     {
+      "description": "Its own branch, out of group:allNonMajor: the publisher keeps only ten weekly tags, so this update must land even when another member of the group blocks the shared branch (it was in error on 2026-11-23, while 2026-35 had already been withdrawn).",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["bosa/opendata-best-webapi"],
+      "groupName": "BeSt address register"
+    },
+    {
       "description": "KrakenD 3.x refuses the configuration ghcr.io/optimce/swagger2krakend generates (\"unsupported version: 3 (want: 4)\"), so a 3.x bump would leave the gateway unable to start and every /api route down. Hold the 2.x line until a swagger2krakend release emits version 4, then remove this rule in the same change that moves the pin. Checked 2026-10-07 against 3.0.0.",
       "matchDatasources": ["docker"],
       "matchPackageNames": ["krakend"],
