@@ -50,6 +50,20 @@ start, document-generation's image goes out no later than the annexe's, and
 - **`max_connections` 300 → 350** (320 counted, the signature profile included):
   recreates `postgres` on the next `up`.
 
+### Added (a rate limit on the whole API)
+
+- **nginx, `location /api/`:** 10 requests a second per client address, a burst of
+  200 refused beyond, answered **429** (not nginx's default 503, which the SPA retries
+  twice). It is a flood cap, not a quota. Sized on two days of e2e traffic, which all
+  came from one address: the busiest second held 55 requests, the busiest minute 364.
+  Replayed through the limit, none is refused. The realtime stream and
+  `/api/live-public/enroll` keep their own locations and are not counted.
+- **Before relying on it, check the address nginx sees:** in the access log's first
+  column, no single 172.x address may dominate. IPv6 clients forwarded by
+  docker-proxy arrive with the Docker bridge's address, and then they all share one
+  bucket. Rollout: re-run `nginx-config`, then `nginx -t` and `nginx -s reload` in the
+  reverse proxy.
+
 ### Added (realtime SSE and maps)
 
 - **`redis`** — the realtime ticket store and pub/sub bus, on a new `redis` network
